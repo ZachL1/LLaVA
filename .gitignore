@@ -12,6 +12,10 @@ dist
 
 # Data
 !**/alpaca-data-conversation.json
+models/vicuna-13b-v1.5/
+playground/data/LLaVA-Pretrain/
+playground/data/coco2014_val_qa_eval/
+dit_no_kl/
 
 # Editor
 .idea
