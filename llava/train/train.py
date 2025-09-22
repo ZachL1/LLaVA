@@ -64,6 +64,9 @@ class ModelArguments:
     mm_use_im_patch_token: bool = field(default=True)
     mm_patch_merge_type: Optional[str] = field(default='flat')
     mm_vision_select_feature: Optional[str] = field(default="patch")
+    cave_config: Optional[str] = field(default="./cave/config.yaml")
+    cave_ckpt: Optional[str] = field(default=None)
+    cave_token: Optional[int] = field(default=256)
 
 
 @dataclass
@@ -908,6 +911,7 @@ def train(attn_implementation=None):
             conversation_lib.default_conversation = conversation_lib.conv_templates["vicuna_v1"]
 
     if model_args.vision_tower is not None:
+        model: LlavaLlamaForCausalLM = model
         model.get_model().initialize_vision_modules(
             model_args=model_args,
             fsdp=training_args.fsdp

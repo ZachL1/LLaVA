@@ -2,6 +2,93 @@ import torch
 import torch.nn as nn
 
 from transformers import CLIPVisionModel, CLIPImageProcessor, CLIPVisionConfig
+from transformers.modeling_outputs import BaseModelOutputWithPooling
+
+from omegaconf import OmegaConf
+from cave.cave_with_vae import CAVEWithVAE
+
+class CAVEEncoderTower(nn.Module):
+    def __init__(self, vision_tower, args, delay_load=False):
+        super().__init__()
+
+        self.is_loaded = False
+
+        self.vision_tower = CAVEWithVAE(OmegaConf.load(args.cave_config))
+        self.cave_ckpt = args.cave_ckpt
+        self.cave_token = args.cave_token
+        # {
+        #     "crop_size": 256,
+        #     "do_center_crop": true,
+        #     "do_normalize": true,
+        #     "do_resize": true,
+        #     "feature_extractor_type": "CLIPFeatureExtractor",
+        #     "image_mean": [
+        #         0.5,
+        #         0.5,
+        #         0.5
+        #     ],
+        #     "image_std": [
+        #         0.5,
+        #         0.5,
+        #         0.5
+        #     ],
+        #     "resample": 3,
+        #     "size": 256
+        # }
+        self.image_processor = CLIPImageProcessor(
+            crop_size=256,
+            do_center_crop=True,
+            do_normalize=True,
+            do_resize=True,
+            image_mean=[0.5, 0.5, 0.5],
+            image_std=[0.5, 0.5, 0.5],
+            resample=3,
+            size=256,
+        )
+        self.load_model()
+
+    def load_model(self):
+        if self.is_loaded:
+            print('{} is already loaded, `load_model` called again, skipping.'.format(self.cave_ckpt))
+            return
+
+        self.vision_tower.load_checkpoint(self.cave_ckpt)
+        self.vision_tower.requires_grad_(False)
+        self.vision_tower.eval()
+
+        self.is_loaded = True
+    
+    @torch.no_grad()
+    def forward(self, images):
+        if type(images) is list:
+            image_features = []
+            for image in images:
+                image_feature = self.vision_tower.encode(image.unsqueeze(0), num_context_tokens=self.cave_token)
+                image_features.append(image_feature)
+        else:
+            image_feature = self.vision_tower.encode(images, num_context_tokens=self.cave_token)
+        
+        return image_feature
+
+    # @property
+    # def dummy_feature(self):
+    #     return torch.zeros(1, self.hidden_size, device=self.device, dtype=self.dtype)
+
+    # @property
+    # def dtype(self):
+    #     return self.vision_tower.dtype
+
+    # @property
+    # def device(self):
+    #     return self.vision_tower.device
+
+    @property
+    def hidden_size(self):
+        return 1536
+
+    @property
+    def num_patches(self):
+        return  self.cave_token
 
 
 class CLIPVisionTower(nn.Module):
@@ -32,7 +119,7 @@ class CLIPVisionTower(nn.Module):
 
         self.is_loaded = True
 
-    def feature_select(self, image_forward_outs):
+    def feature_select(self, image_forward_outs: BaseModelOutputWithPooling):
         image_features = image_forward_outs.hidden_states[self.select_layer]
         if self.select_feature == 'patch':
             image_features = image_features[:, 1:]
@@ -51,7 +138,7 @@ class CLIPVisionTower(nn.Module):
                 image_feature = self.feature_select(image_forward_out).to(image.dtype)
                 image_features.append(image_feature)
         else:
-            image_forward_outs = self.vision_tower(images.to(device=self.device, dtype=self.dtype), output_hidden_states=True)
+            image_forward_outs: BaseModelOutputWithPooling = self.vision_tower(images.to(device=self.device, dtype=self.dtype), output_hidden_states=True)
             image_features = self.feature_select(image_forward_outs).to(images.dtype)
 
         return image_features
