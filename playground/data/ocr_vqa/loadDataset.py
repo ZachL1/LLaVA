@@ -26,7 +26,7 @@ if download == 1:
     for k in data.keys():
         ext=os.path.splitext(data[k]['imageURL'])[1]
         outputFile='images/%s%s'%(k,ext)
-        pdb.set_trace()
+        # pdb.set_trace()
         ureq.urlretrieve(data[k]['imageURL'],outputFile)    
 
 

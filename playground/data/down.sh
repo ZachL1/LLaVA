@@ -24,16 +24,11 @@ unzip -o train_val_images.zip &
 cd ..
 
 mkdir -p vg && cd vg
-mkdir -p VG_100K && cd VG_100K
 wget -c https://cs.stanford.edu/people/rak248/VG_100K_2/images.zip
 unzip -o images.zip &
-cd ..
 
-mkdir -p VG_100K_2 && cd VG_100K_2
 wget -c https://cs.stanford.edu/people/rak248/VG_100K_2/images2.zip
 unzip -o images2.zip &
-cd ..
-
 cd ..
 
 cd ocr_vqa
