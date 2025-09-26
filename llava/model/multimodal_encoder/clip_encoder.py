@@ -13,6 +13,8 @@ class CAVEEncoderTower(nn.Module):
 
         self.is_loaded = False
 
+        self.use_learnable = "learnable" in vision_tower
+        self.kl = "kl" in vision_tower
         self.vision_tower = CAVEWithVAE(OmegaConf.load(args.cave_config))
         self.cave_ckpt = args.cave_ckpt
         self.cave_token = args.cave_token
@@ -52,7 +54,7 @@ class CAVEEncoderTower(nn.Module):
             print('{} is already loaded, `load_model` called again, skipping.'.format(self.cave_ckpt))
             return
 
-        self.vision_tower.load_checkpoint(self.cave_ckpt)
+        self.vision_tower.load_checkpoint(self.cave_ckpt, kl=self.kl, use_learnable=self.use_learnable)
         self.vision_tower.requires_grad_(False)
         self.vision_tower.eval()
 
@@ -63,10 +65,10 @@ class CAVEEncoderTower(nn.Module):
         if type(images) is list:
             image_features = []
             for image in images:
-                image_feature = self.vision_tower.encode(image.unsqueeze(0), num_context_tokens=self.cave_token)
+                image_feature = self.vision_tower.encode(image.unsqueeze(0), num_context_tokens=self.cave_token, use_vae_training=self.kl)
                 image_features.append(image_feature)
         else:
-            image_feature = self.vision_tower.encode(images, num_context_tokens=self.cave_token)
+            image_feature = self.vision_tower.encode(images, num_context_tokens=self.cave_token, use_vae_training=self.kl)
         
         return image_feature
 

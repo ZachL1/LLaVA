@@ -196,9 +196,9 @@ class CAVELatentEncoder(nn.Module):
         self.learnable_context_tokens = nn.Parameter(
             scale * torch.randn(self.max_context_tokens, hidden_size))
         
-        # # For VAE: project to mean and log_var
-        # self.to_mean = nn.Linear(hidden_size, hidden_size)
-        # self.to_log_var = nn.Linear(hidden_size, hidden_size)
+        # For VAE: project to mean and log_var
+        self.to_mean = nn.Linear(hidden_size, hidden_size)
+        self.to_log_var = nn.Linear(hidden_size, hidden_size)
         
         # # Initialize log_var projection to output small values initially
         # nn.init.zeros_(self.to_log_var.weight)
@@ -355,9 +355,9 @@ class CAVELatentDecoder(nn.Module):
         else:
             self.context_proj = nn.Identity()
 
-        # self.learnable_latent_tokens = nn.Parameter(
-        #     torch.randn(16, 32, 32)
-        # )
+        self.learnable_latent_tokens = nn.Parameter(
+            torch.randn(16, 32, 32)
+        )
     
     def _initialize_pos_embed(self):
         """Initialize positional embeddings for decoder."""
@@ -396,7 +396,6 @@ class CAVELatentDecoder(nn.Module):
             x_latent_out: output latent tensor (B, 16, H_latent, W_latent)
         """
         batch_size = x_latent.size(0)
-        # latent_tokens = self.learnable_latent_tokens.unsqueeze(0).expand(batch_size, -1, -1, -1)
         
         # Project context if needed
         if context is not None:
@@ -493,7 +492,7 @@ class CAVEWithVAE(BaseModel, PyTorchModelHubMixin):
         eps = torch.randn_like(std)
         return mean + eps * std
     
-    def forward(self, x, use_diffusion=False, train_diffusion=False, return_latents=False, num_context_tokens=None, use_vae_training=False):
+    def forward(self, x, use_diffusion=False, train_diffusion=False, return_latents=False, num_context_tokens=None, use_vae_training=False, use_learnable=False):
         """
         Forward pass for CAVE with VAE.
         
@@ -548,6 +547,8 @@ class CAVEWithVAE(BaseModel, PyTorchModelHubMixin):
             # Use reconstruction decoder
             # Create noise latent for decoder input (proper generative approach)
             noise_latent = torch.randn_like(x_latent_trainable, dtype=model_dtype)
+            if use_learnable:
+                noise_latent = self.decoder.learnable_latent_tokens.unsqueeze(0).expand(x_latent_trainable.shape[0], -1, -1, -1)
             
             # Decoder learns to reconstruct the original latent from noise + context
             reconstructed_latent = self.decoder(noise_latent, context=context)
@@ -583,7 +584,7 @@ class CAVEWithVAE(BaseModel, PyTorchModelHubMixin):
             context = self.encoder(x_latent)
         return context
     
-    def decode(self, context, latent_shape=None, noise=None):
+    def decode(self, context, latent_shape=None, noise=None, use_learnable=False):
         """Decode context tokens to images via latent space."""
         if noise is None and latent_shape is None:
             raise ValueError("Either noise or latent_shape must be provided")
@@ -591,6 +592,8 @@ class CAVEWithVAE(BaseModel, PyTorchModelHubMixin):
         if noise is None:
             # Create noise with specified shape
             noise = torch.randn(latent_shape, device=context.device, dtype=context.dtype)
+        if use_learnable:
+            noise = self.decoder.learnable_latent_tokens.unsqueeze(0).expand(latent_shape[0], -1, -1, -1)
         
         # Decode context to latent
         reconstructed_latent = self.decoder(noise, context=context)
@@ -622,7 +625,7 @@ class CAVEWithVAE(BaseModel, PyTorchModelHubMixin):
         # SD3.5 VAE has 8x downsampling factor
         return (B, 16, H // 8, W // 8)
 
-    def load_checkpoint(self, checkpoint_dir):
+    def load_checkpoint(self, checkpoint_dir, kl=False, use_learnable=False):
         index_file = os.path.join(checkpoint_dir, "pytorch_model.bin.index.json")
         # Load the state_dict from all shards
         with open(index_file, 'r') as f:
@@ -646,7 +649,11 @@ class CAVEWithVAE(BaseModel, PyTorchModelHubMixin):
         # Clean state dict keys to ensure they match the model structure.
         clean_state_dict = {}
         for key, value in state_dict.items():
-            if key.startswith('encoder.to_mean.') or key.startswith('encoder.to_log_var.') or key.startswith("decoder.learnable_latent_tokens"):
+            if not kl and (key.startswith('encoder.to_mean.') or key.startswith('encoder.to_log_var.')):
+                print("[WARNING] using a checkpoint with kl training!!!")
+                continue
+            if not use_learnable and key.startswith("decoder.learnable_latent_tokens"):
+                print("[WARNING] using a checkpoint with learnable token training!!!")
                 continue
             new_key = key
             # Handle the common 'module.' prefix from models saved with DataParallel.
@@ -656,4 +663,4 @@ class CAVEWithVAE(BaseModel, PyTorchModelHubMixin):
 
         # First, attempt to load the checkpoint with strict=True for perfect matching.
         print("Attempting to load state dict with strict checking...")
-        self.load_state_dict(clean_state_dict, strict=True)
+        self.load_state_dict(clean_state_dict, strict=False)
