@@ -581,7 +581,7 @@ class CAVEWithVAE(BaseModel, PyTorchModelHubMixin):
             mean, log_var = self.encoder(x_latent, num_context_tokens=num_context_tokens, return_vae_params=True)
             context = self.reparameterize(mean, log_var)
         else:
-            context = self.encoder(x_latent)
+            context = self.encoder(x_latent, num_context_tokens=num_context_tokens, return_vae_params=False)
         return context
     
     def decode(self, context, latent_shape=None, noise=None, use_learnable=False):
