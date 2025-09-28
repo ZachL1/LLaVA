@@ -54,6 +54,10 @@ class LlavaMetaModel:
         mm_patch_merge_type = model_args.mm_patch_merge_type
 
         self.config.mm_vision_tower = vision_tower
+        if "cave" in vision_tower:
+            self.config.cave_config = model_args.cave_config
+            self.config.cave_ckpt = model_args.cave_ckpt
+            self.config.cave_token = model_args.cave_token
 
         if self.get_vision_tower() is None:
             vision_tower = build_vision_tower(model_args)

@@ -59,7 +59,7 @@ class SD35VAEWrapper(nn.Module):
             self.load_vae_weights(vae_path)
         
         # Keep VAE on CPU by default to save memory
-        self.vae = self.vae.cpu()
+        # self.vae = self.vae.cpu()
         self.vae.eval()
         
         # VAE scaling factor (SD3.5 uses 1.5305 typically)
