@@ -15,6 +15,11 @@ dist
 models/vicuna-13b-v1.5/
 playground/data/LLaVA-Pretrain/
 playground/data/coco2014_val_qa_eval/
+playground/data/coco/
+playground/data/gqa/
+playground/data/ocr_vqa/
+playground/data/textvqa/
+playground/data/vg/
 dit_no_kl/
 
 # Editor

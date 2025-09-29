@@ -5,7 +5,7 @@ python download.py
 
 
 # Visual Instruction Tuning Data
-cd Visual-Instruction-Tuning
+# cd Visual-Instruction-Tuning
 wget -c https://huggingface.co/datasets/liuhaotian/LLaVA-Instruct-150K/blob/main/llava_v1_5_mix665k.json
 
 mkdir coco && cd coco

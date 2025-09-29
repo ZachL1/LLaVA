@@ -22,12 +22,16 @@ with open('dataset.json', 'r') as fp:
 ################################################################
 ## Make a directory images to store all images there ##########
 if download == 1:
-    os.mkdir('./images')
+    os.makedirs('./images', exist_ok=True)
     for k in data.keys():
         ext=os.path.splitext(data[k]['imageURL'])[1]
         outputFile='images/%s%s'%(k,ext)
         # pdb.set_trace()
-        ureq.urlretrieve(data[k]['imageURL'],outputFile)    
+        try:
+            ureq.urlretrieve(data[k]['imageURL'],outputFile)    
+        except:
+            print(f"Error downloading {data[k]['imageURL']}")
+            continue
 
 
 

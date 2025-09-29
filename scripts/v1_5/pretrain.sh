@@ -1,9 +1,9 @@
 #!/bin/bash
 
-VISION_TOWER=llava-v1.5-13b-cave-pretrain # cave without kl, without learnable
-# VISION_TOWER=llava-v1.5-13b-cave-kl-pretrain # cave with kl, without learnable
-# VISION_TOWER=llava-v1.5-13b-cave-learnable-pretrain # cave without kl, with learnable
-# VISION_TOWER=llava-v1.5-13b-cave-kl-learnable-pretrain # cave with kl, with learnable
+VISION_TOWER=cave-pretrain # cave without kl, without learnable
+# VISION_TOWER=cave-kl-pretrain # cave with kl, without learnable
+# VISION_TOWER=cave-learnable-pretrain # cave without kl, with learnable
+# VISION_TOWER=cave-kl-learnable-pretrain # cave with kl, with learnable
 CAVE_CKPT=/test/annan/cave_converted_weights/
 
 deepspeed llava/train/train_mem.py \
@@ -12,7 +12,7 @@ deepspeed llava/train/train_mem.py \
     --version plain \
     --data_path ./playground/data/LLaVA-Pretrain/blip_laion_cc_sbu_558k.json \
     --image_folder ./playground/data/LLaVA-Pretrain/images \
-    --output_dir ./checkpoints/$VISION_TOWER \
+    --output_dir ./checkpoints/llava-v1.5-13b-$VISION_TOWER \
     --vision_tower $VISION_TOWER \
     --cave_config ./cave/config.yaml \
     --cave_ckpt $CAVE_CKPT \

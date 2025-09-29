@@ -1,13 +1,24 @@
 #!/bin/bash
 
+VISION_TOWER=cave # cave without kl, without learnable
+# VISION_TOWER=cave-kl # cave with kl, without learnable
+# VISION_TOWER=cave-learnable # cave without kl, with learnable
+# VISION_TOWER=cave-kl-learnable # cave with kl, with learnable
+CAVE_CKPT=/test/annan/cave_converted_weights/
+
+
 deepspeed llava/train/train_mem.py \
     --deepspeed ./scripts/zero3.json \
-    --model_name_or_path lmsys/vicuna-13b-v1.5 \
+    --model_name_or_path ./models/vicuna-13b-v1.5 \
     --version v1 \
     --data_path ./playground/data/llava_v1_5_mix665k.json \
     --image_folder ./playground/data \
-    --vision_tower openai/clip-vit-large-patch14-336 \
-    --pretrain_mm_mlp_adapter ./checkpoints/llava-v1.5-13b-pretrain/mm_projector.bin \
+    --output_dir ./checkpoints/llava-v1.5-13b-$VISION_TOWER-finetune \
+    --vision_tower $VISION_TOWER \
+    --cave_config ./cave/config.yaml \
+    --cave_ckpt $CAVE_CKPT \
+    --cave_token 256 \
+    --pretrain_mm_mlp_adapter ./checkpoints/llava-v1.5-13b-$VISION_TOWER-pretrain/mm_projector.bin \
     --mm_projector_type mlp2x_gelu \
     --mm_vision_select_layer -2 \
     --mm_use_im_start_end False \
@@ -15,7 +26,6 @@ deepspeed llava/train/train_mem.py \
     --image_aspect_ratio pad \
     --group_by_modality_length True \
     --bf16 True \
-    --output_dir ./checkpoints/llava-v1.5-13b \
     --num_train_epochs 1 \
     --per_device_train_batch_size 16 \
     --per_device_eval_batch_size 4 \
