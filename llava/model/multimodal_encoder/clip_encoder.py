@@ -47,9 +47,10 @@ class CAVEEncoderTower(nn.Module):
             resample=3,
             size=256,
         )
-        self.load_model()
+        if not delay_load or getattr(args, 'unfreeze_mm_vision_tower', False):
+            self.load_model()
 
-    def load_model(self):
+    def load_model(self, device_map=None):
         if self.is_loaded:
             print('{} is already loaded, `load_model` called again, skipping.'.format(self.cave_ckpt))
             return

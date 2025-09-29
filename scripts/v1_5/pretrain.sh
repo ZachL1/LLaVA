@@ -1,9 +1,9 @@
 #!/bin/bash
 
-VISION_TOWER=llava-v1.5-13b-pretrain-cave # cave without kl, without learnable
-# VISION_TOWER=llava-v1.5-13b-pretrain-cave-kl # cave with kl, without learnable
-# VISION_TOWER=llava-v1.5-13b-pretrain-cave-learnable # cave without kl, with learnable
-# VISION_TOWER=llava-v1.5-13b-pretrain-cave-kl-learnable # cave with kl, with learnable
+VISION_TOWER=llava-v1.5-13b-cave-pretrain # cave without kl, without learnable
+# VISION_TOWER=llava-v1.5-13b-cave-kl-pretrain # cave with kl, without learnable
+# VISION_TOWER=llava-v1.5-13b-cave-learnable-pretrain # cave without kl, with learnable
+# VISION_TOWER=llava-v1.5-13b-cave-kl-learnable-pretrain # cave with kl, with learnable
 CAVE_CKPT=/test/annan/cave_converted_weights/
 
 deepspeed llava/train/train_mem.py \
