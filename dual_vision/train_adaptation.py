@@ -17,7 +17,10 @@ import argparse
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset
+from torch.utils.data.distributed import DistributedSampler
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torchvision import transforms
@@ -32,6 +35,42 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config import DualVisionConfig
 from utils import create_dual_encoder
+
+
+def setup_distributed():
+    """Initialize distributed training."""
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+        rank = int(os.environ['RANK'])
+        world_size = int(os.environ['WORLD_SIZE'])
+        local_rank = int(os.environ['LOCAL_RANK'])
+    elif 'SLURM_PROCID' in os.environ:
+        rank = int(os.environ['SLURM_PROCID'])
+        world_size = int(os.environ['SLURM_NTASKS'])
+        local_rank = rank % torch.cuda.device_count()
+    else:
+        print('Not using distributed mode')
+        return 0, 1, 0, False
+    
+    torch.cuda.set_device(local_rank)
+    dist.init_process_group(
+        backend='nccl',
+        init_method='env://',
+        world_size=world_size,
+        rank=rank
+    )
+    dist.barrier()
+    return rank, world_size, local_rank, True
+
+
+def cleanup_distributed():
+    """Cleanup distributed training."""
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def is_main_process(rank):
+    """Check if this is the main process."""
+    return rank == 0
 
 
 class ImageDataset(Dataset):
@@ -119,7 +158,8 @@ def train_one_epoch(
     optimizer,
     device,
     loss_type: str = 'combined',
-    encoder_type: str = 'vit'
+    encoder_type: str = 'vit',
+    rank: int = 0
 ):
     """Train for one epoch."""
     model.train()
@@ -128,7 +168,11 @@ def train_one_epoch(
     total_loss = 0
     num_batches = 0
     
-    pbar = tqdm(dataloader, desc="Training")
+    # Only show progress bar on main process
+    if rank == 0:
+        pbar = tqdm(dataloader, desc="Training")
+    else:
+        pbar = dataloader
     for batch in pbar:
         images = batch.to(device)
         
@@ -166,7 +210,7 @@ def train_one_epoch(
 
 
 @torch.no_grad()
-def evaluate(model, teacher, dataloader, device, loss_type: str, encoder_type: str):
+def evaluate(model, teacher, dataloader, device, loss_type: str, encoder_type: str, rank: int = 0):
     """Evaluate model."""
     model.eval()
     teacher.eval()
@@ -174,7 +218,13 @@ def evaluate(model, teacher, dataloader, device, loss_type: str, encoder_type: s
     total_loss = 0
     num_batches = 0
     
-    for batch in tqdm(dataloader, desc="Evaluating"):
+    # Only show progress bar on main process
+    if rank == 0:
+        iterator = tqdm(dataloader, desc="Evaluating")
+    else:
+        iterator = dataloader
+    
+    for batch in iterator:
         images = batch.to(device)
         
         # Forward through student
@@ -259,22 +309,32 @@ def main():
     
     args = parser.parse_args()
     
+    # Setup distributed training
+    rank, world_size, local_rank, is_distributed = setup_distributed()
+    
     # Set seed
-    torch.manual_seed(args.seed)
+    torch.manual_seed(args.seed + rank)  # Different seed per rank
     
-    # Create output directory
-    os.makedirs(args.output_dir, exist_ok=True)
-    
-    # Save config
-    with open(os.path.join(args.output_dir, 'config.json'), 'w') as f:
-        json.dump(vars(args), f, indent=2)
+    # Only main process creates directories and saves config
+    if is_main_process(rank):
+        os.makedirs(args.output_dir, exist_ok=True)
+        with open(os.path.join(args.output_dir, 'config.json'), 'w') as f:
+            json.dump(vars(args), f, indent=2)
     
     # Setup device
-    device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
+    if is_distributed:
+        device = torch.device(f'cuda:{local_rank}')
+    else:
+        device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
+    
+    if is_main_process(rank):
+        print(f"Using device: {device}")
+        if is_distributed:
+            print(f"Distributed training with {world_size} GPUs")
     
     # Create student (dual encoder) first to get preprocessor
-    print(f"Creating dual vision encoder...")
+    if is_main_process(rank):
+        print(f"Creating dual vision encoder...")
     student = create_dual_encoder(
         encoder_type=args.encoder_type,
         pretrained_path=args.pretrained_model,
@@ -284,51 +344,94 @@ def main():
     )
     
     # Get preprocessor from encoder (matches pretrained model)
-    print("Using preprocessor from pretrained model...")
+    if is_main_process(rank):
+        print("Using preprocessor from pretrained model...")
     transform = student.preprocessor
     
     # Create datasets
-    print("Loading datasets...")
+    if is_main_process(rank):
+        print("Loading datasets...")
     train_dataset = ImageDataset(args.data_path, transform=transform)
+    
+    # Use DistributedSampler for multi-GPU training
+    if is_distributed:
+        train_sampler = DistributedSampler(
+            train_dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True
+        )
+        shuffle = False  # Sampler handles shuffling
+    else:
+        train_sampler = None
+        shuffle = True
+    
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=shuffle,
+        sampler=train_sampler,
         num_workers=args.num_workers,
         pin_memory=True
     )
     
     val_loader = None
+    val_sampler = None
     if args.val_data_path:
         val_dataset = ImageDataset(args.val_data_path, transform=transform)
+        
+        if is_distributed:
+            val_sampler = DistributedSampler(
+                val_dataset,
+                num_replicas=world_size,
+                rank=rank,
+                shuffle=False
+            )
+        
         val_loader = DataLoader(
             val_dataset,
             batch_size=args.batch_size,
             shuffle=False,
+            sampler=val_sampler,
             num_workers=args.num_workers,
             pin_memory=True
         )
     
-    print(f"Training samples: {len(train_dataset)}")
-    if val_loader:
-        print(f"Validation samples: {len(val_dataset)}")
+    if is_main_process(rank):
+        print(f"Training samples: {len(train_dataset)}")
+        if val_loader:
+            print(f"Validation samples: {len(val_dataset)}")
     
     # Create teacher encoder
-    print(f"Creating teacher encoder: {args.encoder_type}")
+    if is_main_process(rank):
+        print(f"Creating teacher encoder: {args.encoder_type}")
     teacher = create_teacher_encoder(args.encoder_type, args.pretrained_model)
     teacher = teacher.to(device)
     
     student = student.to(device)
     
+    # Wrap student with DDP for distributed training
+    if is_distributed:
+        student = DDP(
+            student,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            find_unused_parameters=False
+        )
+    
     # Freeze left branch
-    print("Freezing left branch parameters...")
-    student.freeze_left_branch()
+    if is_main_process(rank):
+        print("Freezing left branch parameters...")
+    # Access the underlying model if wrapped with DDP
+    model_without_ddp = student.module if is_distributed else student
+    model_without_ddp.freeze_left_branch()
     
     # Count parameters
     total_params = sum(p.numel() for p in student.parameters())
     trainable_params = sum(p.numel() for p in student.parameters() if p.requires_grad)
-    print(f"Total parameters: {total_params:,}")
-    print(f"Trainable parameters (right branch): {trainable_params:,}")
+    if is_main_process(rank):
+        print(f"Total parameters: {total_params:,}")
+        print(f"Trainable parameters (right branch): {trainable_params:,}")
     
     # Create optimizer
     optimizer = AdamW(
@@ -343,6 +446,11 @@ def main():
         T_max=args.num_epochs,
         eta_min=args.lr * 0.1
     )
+    
+    # Training loop
+    if is_main_process(rank):
+        print("Starting training...")
+    best_val_loss = float('inf')
 
     if val_loader:
         val_loss = evaluate(
@@ -353,15 +461,18 @@ def main():
             loss_type=args.loss_type,
             encoder_type=args.encoder_type
         )
-        print(f"Val loss: {val_loss:.4f}")
+        if is_main_process(rank):
+            print(f"Initial Val loss: {val_loss:.4f}")
     
-    # Training loop
-    print("Starting training...")
-    best_val_loss = float('inf')
     
     for epoch in range(args.num_epochs):
-        print(f"\nEpoch {epoch + 1}/{args.num_epochs}")
+        if is_main_process(rank):
+            print(f"\nEpoch {epoch + 1}/{args.num_epochs}")
         torch.cuda.empty_cache()
+        
+        # Set epoch for DistributedSampler
+        if is_distributed and train_sampler is not None:
+            train_sampler.set_epoch(epoch)
         
         # Train
         train_loss = train_one_epoch(
@@ -371,10 +482,12 @@ def main():
             optimizer=optimizer,
             device=device,
             loss_type=args.loss_type,
-            encoder_type=args.encoder_type
+            encoder_type=args.encoder_type,
+            rank=rank
         )
         
-        print(f"Train loss: {train_loss:.4f}")
+        if is_main_process(rank):
+            print(f"Train loss: {train_loss:.4f}")
         
         # Validate
         if val_loader:
@@ -384,25 +497,28 @@ def main():
                 dataloader=val_loader,
                 device=device,
                 loss_type=args.loss_type,
-                encoder_type=args.encoder_type
+                encoder_type=args.encoder_type,
+                rank=rank
             )
-            print(f"Val loss: {val_loss:.4f}")
             
-            # Save best model
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                torch.save(
-                    student.state_dict(),
-                    os.path.join(args.output_dir, 'best_model.pt')
-                )
-                print(f"Saved best model with val loss: {val_loss:.4f}")
+            if is_main_process(rank):
+                print(f"Val loss: {val_loss:.4f}")
+                
+                # Save best model (only on main process)
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    torch.save(
+                        model_without_ddp.state_dict(),
+                        os.path.join(args.output_dir, 'best_model.pt')
+                    )
+                    print(f"Saved best model with val loss: {val_loss:.4f}")
         
-        # Save checkpoint
-        if (epoch + 1) % args.save_every == 0:
+        # Save checkpoint (only on main process)
+        if is_main_process(rank) and (epoch + 1) % args.save_every == 0:
             checkpoint_path = os.path.join(args.output_dir, f'checkpoint_epoch_{epoch+1}.pt')
             torch.save({
                 'epoch': epoch + 1,
-                'model_state_dict': student.state_dict(),
+                'model_state_dict': model_without_ddp.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
                 'train_loss': train_loss,
@@ -412,10 +528,14 @@ def main():
         # Step scheduler
         scheduler.step()
     
-    # Save final model
-    final_path = os.path.join(args.output_dir, 'final_model.pt')
-    torch.save(student.state_dict(), final_path)
-    print(f"\nTraining complete! Final model saved to: {final_path}")
+    # Save final model (only on main process)
+    if is_main_process(rank):
+        final_path = os.path.join(args.output_dir, 'final_model.pt')
+        torch.save(model_without_ddp.state_dict(), final_path)
+        print(f"\nTraining complete! Final model saved to: {final_path}")
+    
+    # Cleanup distributed training
+    cleanup_distributed()
 
 
 if __name__ == '__main__':
