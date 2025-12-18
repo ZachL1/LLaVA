@@ -149,12 +149,17 @@ class DualVisionEncoder(nn.Module):
                 config.num_positions, config.hidden_size
             )
         
+        # Pre-layer norms (applied to embeddings before transformer layers)
+        # CLIP applies layer norm to combined patch+position embeddings before encoder
+        self.pre_layrnorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.pre_layrnorm_mot = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        
         # Transformer layers
         self.layers = nn.ModuleList([
             DualVisionEncoderLayer(config) for _ in range(config.num_layers)
         ])
         
-        # Final layer norms
+        # Final layer norms (applied to pooled output)
         self.final_layernorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.final_layernorm_mot = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         
@@ -271,6 +276,10 @@ class DualVisionEncoder(nn.Module):
         
         right_embeddings = self.dropout(right_embeddings)
         
+        # Apply pre-layer normalization (CLIP adds this after embeddings)
+        left_embeddings = self.pre_layrnorm(left_embeddings)
+        right_embeddings = self.pre_layrnorm_mot(right_embeddings)
+        
         # ===== Pass through transformer layers =====
         hidden_states_left = left_embeddings
         hidden_states_right = right_embeddings
@@ -280,13 +289,14 @@ class DualVisionEncoder(nn.Module):
                 hidden_states_left, hidden_states_right
             )
         
-        # Final layer norms
-        hidden_states_left = self.final_layernorm(hidden_states_left)
-        hidden_states_right = self.final_layernorm_mot(hidden_states_right)
-        
         # ===== Pooling =====
+        # Pool BEFORE final layer norm (matching CLIP's implementation)
         pooled_left = self._pool_features(hidden_states_left)
         pooled_right = self._pool_features(hidden_states_right)
+        
+        # Apply final layer norm to POOLED outputs (not all tokens)
+        pooled_left = self.final_layernorm(pooled_left)
+        pooled_right = self.final_layernorm_mot(pooled_right)
         
         # Select output based on config
         if self.config.output_mode == 'right':

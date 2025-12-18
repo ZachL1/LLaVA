@@ -155,10 +155,10 @@ class DualCLIPVisionEncoder(DualVisionEncoder):
                     new_key = f'layers.{layer_idx}.mlp.fc2' + rest.split('fc2')[1]
                     converted[new_key] = value
             
-            # Pre or post layernorm
-            elif key.startswith('pre_layrnorm') or key.startswith('pre_layernorm'):
-                # CLIP uses pre-layernorm, we'll skip this as it's handled per-layer
-                pass
+            # Pre-layernorm (applied to embeddings before encoder)
+            elif 'pre_layrnorm' in key or 'pre_layernorm' in key:
+                converted['pre_layrnorm' + key.split('pre_layrnorm')[1]] = value
+            # Post-layernorm (applied to pooled output)
             elif key.startswith('post_layernorm'):
                 converted['final_layernorm' + key[14:]] = value
         
@@ -179,7 +179,8 @@ class DualCLIPVisionEncoder(DualVisionEncoder):
             'attention.q_proj', 'attention.k_proj', 'attention.v_proj', 'attention.o_proj',
             'input_layernorm', 'post_attention_layernorm',
             'mlp.fc1', 'mlp.fc2',
-            'final_layernorm'
+            'pre_layrnorm',  # Applied to embeddings before encoder
+            'final_layernorm'  # Applied to pooled output
         ]
         
         for key, value in state_dict.items():

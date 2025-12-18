@@ -59,6 +59,7 @@ class DualVisionConfig:
     use_qk_norm: bool = False
     auxiliary_token_init: Literal['random', 'gaussian', 'uniform'] = 'gaussian'
     random_token_std: float = 0.02
+    attention_mode: Literal['joint', 'cross'] = 'joint'  # joint: both branches attend to each other; cross: right queries left
     
     # Output settings
     output_mode: Literal['right', 'left', 'both', 'concat'] = 'right'

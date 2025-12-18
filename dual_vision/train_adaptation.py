@@ -204,7 +204,8 @@ def train_one_epoch(
         total_loss += loss.item()
         num_batches += 1
         
-        pbar.set_postfix({'loss': total_loss / num_batches})
+        if rank == 0:
+            pbar.set_postfix({'loss': total_loss / num_batches})
     
     return total_loss / num_batches
 
@@ -260,6 +261,9 @@ def main():
                        help='Type of vision encoder')
     parser.add_argument('--pretrained_model', type=str, required=True,
                        help='Pretrained model name or path')
+    parser.add_argument('--attention_type', type=str, default='cross',
+                       choices=['joint', 'cross'],
+                       help='Type of attention to use')
     
     # Data settings
     parser.add_argument('--data_path', type=str, required=True,
@@ -340,7 +344,8 @@ def main():
         pretrained_path=args.pretrained_model,
         auxiliary_token_init=args.auxiliary_token_init,
         random_token_std=args.random_token_std,
-        output_mode='right',  # Use right branch output
+        output_mode='right',  # Train right branch to align with teacher
+        attention_mode=args.attention_type
     )
     
     # Get preprocessor from encoder (matches pretrained model)
@@ -416,7 +421,7 @@ def main():
             student,
             device_ids=[local_rank],
             output_device=local_rank,
-            find_unused_parameters=False
+            find_unused_parameters=True
         )
     
     # Freeze left branch
