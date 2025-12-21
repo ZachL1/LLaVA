@@ -180,21 +180,27 @@ def train_one_epoch(
         with torch.cuda.amp.autocast():
             outputs = model(images, return_dict=True)
             student_output = outputs['pooled_output']  # Right branch output by default
+            student_hidden_state = outputs['right_last_hidden_state'] # B x L(1+T) x D
         
         # Forward through teacher
         with torch.no_grad():
             if encoder_type == 'vit':
                 teacher_outputs = teacher(images)
                 teacher_output = teacher_outputs.last_hidden_state[:, 0]  # CLS token
+                teacher_hidden_state = teacher_outputs.last_hidden_state
             elif encoder_type == 'clip':
+                # teacher_outputs = teacher(images, output_hidden_states=True)
                 teacher_outputs = teacher(images)
+                teacher_hidden_state = teacher_outputs.last_hidden_state
                 teacher_output = teacher_outputs.pooler_output
             elif encoder_type == 'siglip':
                 teacher_outputs = teacher(images)
+                teacher_hidden_state = teacher_outputs.last_hidden_state
                 teacher_output = teacher_outputs.pooler_output
         
         # Compute loss
-        loss = compute_alignment_loss(student_output, teacher_output, loss_type)
+        # loss = compute_alignment_loss(student_output, teacher_output, loss_type)
+        loss = compute_alignment_loss(student_hidden_state, teacher_hidden_state, loss_type)
         
         # Backward
         optimizer.zero_grad()

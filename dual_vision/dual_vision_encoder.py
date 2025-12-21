@@ -313,8 +313,8 @@ class DualVisionEncoder(nn.Module):
         if return_dict:
             return {
                 'pooled_output': pooled_output,
-                'left_branch_output': hidden_states_left,
-                'right_branch_output': hidden_states_right,
+                'left_last_hidden_state': hidden_states_left,
+                'right_last_hidden_state': hidden_states_right,
             }
         else:
             return pooled_output, hidden_states_left, hidden_states_right
