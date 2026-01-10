@@ -54,10 +54,22 @@ class LlavaMetaModel:
         mm_patch_merge_type = model_args.mm_patch_merge_type
 
         self.config.mm_vision_tower = vision_tower
+        
+        # Handle CAVE configuration
         if "cave" in vision_tower:
             self.config.cave_config = model_args.cave_config
             self.config.cave_ckpt = model_args.cave_ckpt
             self.config.cave_token = model_args.cave_token
+        
+        # Handle dual_vision configuration
+        if "dual_vision" in vision_tower:
+            self.config.dual_vision_pretrained = getattr(model_args, 'dual_vision_pretrained', None)
+            self.config.dual_vision_num_aux_tokens = getattr(model_args, 'dual_vision_num_aux_tokens', None)
+            self.config.dual_vision_output_mode = getattr(model_args, 'dual_vision_output_mode', 'right')
+            self.config.dual_vision_train_right = getattr(model_args, 'dual_vision_train_right', False)
+            self.config.dual_vision_flash_attn = getattr(model_args, 'dual_vision_flash_attn', True)
+            self.config.dual_vision_attention_mode = getattr(model_args, 'dual_vision_attention_mode', 'joint')
+            self.config.dual_vision_adaptation_ckpt = getattr(model_args, 'dual_vision_adaptation_ckpt', None)
 
         if self.get_vision_tower() is None:
             vision_tower = build_vision_tower(model_args)

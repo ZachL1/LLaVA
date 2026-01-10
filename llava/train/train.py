@@ -67,6 +67,14 @@ class ModelArguments:
     cave_config: Optional[str] = field(default="./cave/config.yaml")
     cave_ckpt: Optional[str] = field(default=None)
     cave_token: Optional[int] = field(default=256)
+    # Dual Vision Tower parameters
+    dual_vision_pretrained: Optional[str] = field(default=None)
+    dual_vision_output_mode: Optional[str] = field(default='right')
+    dual_vision_train_right: bool = field(default=False)
+    dual_vision_num_aux_tokens: Optional[int] = field(default=None)
+    dual_vision_flash_attn: bool = field(default=True)
+    dual_vision_attention_mode: Optional[str] = field(default='joint')
+    dual_vision_adaptation_ckpt: Optional[str] = field(default=None)
 
 
 @dataclass
