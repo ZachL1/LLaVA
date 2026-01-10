@@ -91,6 +91,13 @@ class LlavaMetaModel:
         self.config.mm_vision_select_layer = mm_vision_select_layer
         self.config.mm_vision_select_feature = mm_vision_select_feature
         self.config.mm_patch_merge_type = mm_patch_merge_type
+        
+        # Initialize LLM hidden projection for DualVisionTower
+        if "dual_vision" in model_args.vision_tower and hasattr(vision_tower, 'set_llm_hidden_size'):
+            # Get LLM hidden size from config
+            llm_hidden_size = self.config.hidden_size
+            vision_tower.set_llm_hidden_size(llm_hidden_size)
+            print(f"Initialized DualVisionTower with LLM hidden size: {llm_hidden_size}")
 
         if getattr(self, 'mm_projector', None) is None:
             self.mm_projector = build_vision_projector(self.config)
@@ -153,8 +160,85 @@ class LlavaMetaForCausalLM(ABC):
     def get_vision_tower(self):
         return self.get_model().get_vision_tower()
 
-    def encode_images(self, images):
-        image_features = self.get_model().get_vision_tower()(images)
+    def _get_text_hidden_states(self, input_ids, attention_mask=None):
+        """Get LLM hidden states for text tokens (excluding IMAGE_TOKEN).
+        
+        This method runs a forward pass through the LLM to get hidden states
+        for the text portion of the input, which can be used as auxiliary
+        input for the dual vision tower.
+        
+        Args:
+            input_ids: Input token IDs [batch_size, seq_length]
+            attention_mask: Optional attention mask [batch_size, seq_length]
+            
+        Returns:
+            text_hidden_states: List of hidden states for each batch item,
+                                each of shape [1, text_seq_len, hidden_dim]
+        """
+        batch_size = input_ids.shape[0]
+        text_hidden_states_list = []
+        
+        for batch_idx in range(batch_size):
+            cur_input_ids = input_ids[batch_idx]
+            
+            # Find non-image token positions
+            non_image_mask = cur_input_ids != IMAGE_TOKEN_INDEX
+            
+            # Also filter out padding tokens if attention_mask is provided
+            if attention_mask is not None:
+                cur_attention_mask = attention_mask[batch_idx]
+                non_image_mask = non_image_mask & cur_attention_mask.bool()
+            
+            # Get text token IDs (excluding image tokens)
+            text_token_ids = cur_input_ids[non_image_mask]
+            
+            if len(text_token_ids) == 0:
+                # No text tokens, create a dummy hidden state
+                hidden_dim = self.config.hidden_size
+                dummy_hs = torch.zeros(1, 1, hidden_dim, device=input_ids.device, dtype=self.dtype)
+                text_hidden_states_list.append(dummy_hs)
+                continue
+            
+            # Get embeddings for text tokens
+            text_embeds = self.get_model().embed_tokens(text_token_ids.unsqueeze(0))  # [1, text_len, hidden_dim]
+            
+            # Run through the LLM to get hidden states
+            # We use the base model forward with output_hidden_states=True
+            with torch.no_grad():
+                outputs = self.get_model()(
+                    inputs_embeds=text_embeds,
+                    output_hidden_states=True,
+                    return_dict=True,
+                    use_cache=False,
+                )
+            
+            # Get the last hidden state (output of all transformer layers)
+            # outputs.hidden_states is a tuple of (embedding_output, layer1_output, ..., layerN_output)
+            # We take the last one which is the output of the final layer
+            last_hidden_state = outputs.hidden_states[-1]  # [1, text_len, hidden_dim]
+            
+            text_hidden_states_list.append(last_hidden_state)
+        
+        return text_hidden_states_list
+
+    def encode_images(self, images, text_hidden_states=None):
+        """Encode images through the vision tower.
+        
+        Args:
+            images: Image tensor or list of image tensors
+            text_hidden_states: Optional list of LLM hidden states for dual vision tower
+            
+        Returns:
+            Image features after projection
+        """
+        vision_tower = self.get_model().get_vision_tower()
+        
+        # Check if this is a DualVisionTower that can use text_hidden_states
+        if hasattr(vision_tower, 'llm_hidden_proj') and text_hidden_states is not None:
+            image_features = vision_tower(images, text_hidden_states=text_hidden_states)
+        else:
+            image_features = vision_tower(images)
+        
         image_features = self.get_model().mm_projector(image_features)
         return image_features
 
@@ -166,11 +250,31 @@ class LlavaMetaForCausalLM(ABC):
         if vision_tower is None or images is None or input_ids.shape[1] == 1:
             return input_ids, position_ids, attention_mask, past_key_values, None, labels
 
+        # Get text hidden states for DualVisionTower if applicable
+        text_hidden_states = None
+        if hasattr(vision_tower, 'llm_hidden_proj') and vision_tower.llm_hidden_proj is not None:
+            # print("Getting text hidden states for DualVisionTower")
+            text_hidden_states = self._get_text_hidden_states(input_ids, attention_mask)
+
         if type(images) is list or images.ndim == 5:
             if type(images) is list:
                 images = [x.unsqueeze(0) if x.ndim == 3 else x for x in images]
             concat_images = torch.cat([image for image in images], dim=0)
-            image_features = self.encode_images(concat_images)
+            
+            # For list/multi-image case, we need to handle text_hidden_states appropriately
+            # Each image in the batch should get corresponding text hidden states
+            if text_hidden_states is not None:
+                # Expand text_hidden_states to match concat_images
+                # If we have multiple images per sample, replicate the text hidden states
+                expanded_text_hs = []
+                split_sizes = [image.shape[0] for image in images]
+                for batch_idx, num_imgs in enumerate(split_sizes):
+                    for _ in range(num_imgs):
+                        expanded_text_hs.append(text_hidden_states[batch_idx])
+                image_features = self.encode_images(concat_images, text_hidden_states=expanded_text_hs)
+            else:
+                image_features = self.encode_images(concat_images)
+            
             split_sizes = [image.shape[0] for image in images]
             image_features = torch.split(image_features, split_sizes, dim=0)
             mm_patch_merge_type = getattr(self.config, 'mm_patch_merge_type', 'flat')
@@ -215,7 +319,26 @@ class LlavaMetaForCausalLM(ABC):
             else:
                 raise ValueError(f"Unexpected mm_patch_merge_type: {self.config.mm_patch_merge_type}")
         else:
-            image_features = self.encode_images(images)
+            # Single batch of images
+            if text_hidden_states is not None:
+                # Stack text hidden states into a batch tensor
+                # Each element is [1, seq_len, hidden_dim], but seq_lens may differ
+                # For batch processing, we need to handle variable lengths
+                max_seq_len = max(ths.shape[1] for ths in text_hidden_states)
+                hidden_dim = text_hidden_states[0].shape[2]
+                batch_size = len(text_hidden_states)
+                
+                # Pad to uniform length and stack
+                padded_hs = torch.zeros(batch_size, max_seq_len, hidden_dim, 
+                                       device=text_hidden_states[0].device,
+                                       dtype=text_hidden_states[0].dtype)
+                for i, ths in enumerate(text_hidden_states):
+                    seq_len = ths.shape[1]
+                    padded_hs[i, :seq_len, :] = ths[0]
+                
+                image_features = self.encode_images(images, text_hidden_states=padded_hs)
+            else:
+                image_features = self.encode_images(images)
 
         # TODO: image start / end is not implemented here to support pretraining.
         if getattr(self.config, 'tune_mm_mlp_adapter', False) and getattr(self.config, 'mm_use_im_start_end', False):

@@ -21,6 +21,10 @@ class DualVisionTower(nn.Module):
     
     Supports dual-branch vision encoder with MoT architecture.
     Compatible with CLIP, ViT, and SigLIP base models.
+    
+    The right branch can use either random tokens or LLM hidden states as input.
+    When text_hidden_states are provided to forward(), they are projected to vision
+    hidden dimension and used as auxiliary tokens for the right branch.
     """
     
     def __init__(self, vision_tower, args, delay_load=False):
@@ -68,6 +72,10 @@ class DualVisionTower(nn.Module):
         self.use_flash_attention = getattr(args, 'dual_vision_flash_attn', True)
         self.attention_mode = getattr(args, 'dual_vision_attention_mode', 'joint')  # 'joint' or 'cross'
         self.adaptation_checkpoint = getattr(args, 'dual_vision_adaptation_ckpt', None)  # Path to adaptation trained weights
+        
+        # LLM hidden state projection layer (will be initialized when set_llm_hidden_size is called)
+        self.llm_hidden_proj = None
+        self.llm_hidden_size = None
         
         # Image processor will be set when loading model
         self.image_processor = None
@@ -276,12 +284,66 @@ class DualVisionTower(nn.Module):
         print(f"    - Right branch: {right_branch_params} parameters")
         print("✓ Adaptation weights loaded successfully")
     
+    def set_llm_hidden_size(self, llm_hidden_size):
+        """Initialize the projection layer for LLM hidden states.
+        
+        This must be called after the model is loaded and before using
+        text_hidden_states in forward().
+        
+        Args:
+            llm_hidden_size: Hidden dimension of the LLM (e.g., 4096 for LLaMA-7B)
+        """
+        self.llm_hidden_size = llm_hidden_size
+        vision_hidden_size = self._config.hidden_size
+        
+        # Simple linear projection: LLM hidden dim -> Vision hidden dim
+        self.llm_hidden_proj = nn.Linear(llm_hidden_size, vision_hidden_size)
+        
+        # Initialize with small weights
+        nn.init.normal_(self.llm_hidden_proj.weight, std=0.02)
+        nn.init.zeros_(self.llm_hidden_proj.bias)
+        
+        # Move to same device and dtype as vision tower
+        self.llm_hidden_proj = self.llm_hidden_proj.to(
+            device=self.device,
+            dtype=self.dtype
+        )
+        
+        print(f"Initialized LLM hidden projection: {llm_hidden_size} -> {vision_hidden_size}")
+    
+    def _align_sequence_length(self, hidden_states, target_length):
+        """Align hidden states sequence length to target length via truncation/padding.
+        
+        Args:
+            hidden_states: Tensor of shape [batch_size, seq_length, hidden_dim]
+            target_length: Target sequence length
+            
+        Returns:
+            Tensor of shape [batch_size, target_length, hidden_dim]
+        """
+        batch_size, seq_length, hidden_dim = hidden_states.shape
+        
+        if seq_length == target_length:
+            return hidden_states
+        elif seq_length > target_length:
+            # Truncate: keep the last target_length tokens (more recent context)
+            return hidden_states[:, -target_length:, :]
+        else:
+            # Pad: replicate the last token to fill
+            padding_length = target_length - seq_length
+            last_token = hidden_states[:, -1:, :].expand(-1, padding_length, -1)
+            return torch.cat([hidden_states, last_token], dim=1)
+    
     @torch.no_grad()
-    def forward(self, images):
+    def forward(self, images, text_hidden_states=None):
         """Forward pass through dual vision tower.
         
         Args:
-            images: Image tensor [batch_size, channels, height, width]
+            images: Image tensor [batch_size, channels, height, width] or list of tensors
+            text_hidden_states: Optional LLM hidden states for right branch input.
+                - If provided as a tensor: [batch_size, seq_length, llm_hidden_dim]
+                - If provided as a list: list of [1, seq_length, llm_hidden_dim] tensors
+                - If None: falls back to random tokens
             
         Returns:
             Image features based on output_mode setting
@@ -297,22 +359,42 @@ class DualVisionTower(nn.Module):
         else:
             num_aux_tokens = self.num_auxiliary_tokens
         
-        # Generate random auxiliary tokens for right branch
-        # This will be replaced with more meaningful tokens in future versions
-        # (e.g., text embeddings, LLM hidden states, etc.)
+        # Prepare auxiliary tokens for right branch
+        # Use LLM hidden states if provided, otherwise fall back to random tokens
+        use_text_hidden_states = (
+            text_hidden_states is not None and 
+            self.llm_hidden_proj is not None
+        )
+        
         if type(images) is list:
             # Handle list of images
             auxiliary_tokens_list = []
-            for image in images:
-                aux_tokens = generate_random_tokens(
-                    batch_size=1,
-                    seq_length=num_aux_tokens,
-                    hidden_dim=self._config.hidden_size,
-                    distribution='gaussian',
-                    std=0.02,
-                    device=image.device,
-                    dtype=image.dtype
-                )
+            
+            for idx, image in enumerate(images):
+                if use_text_hidden_states:
+                    # Get text hidden states for this image
+                    if isinstance(text_hidden_states, list):
+                        text_hs = text_hidden_states[idx]  # [1, seq_len, llm_hidden_dim]
+                    else:
+                        text_hs = text_hidden_states[idx:idx+1]  # [1, seq_len, llm_hidden_dim]
+                    
+                    # Project to vision hidden dimension
+                    projected_hs = self.llm_hidden_proj(text_hs)  # [1, seq_len, vision_hidden_dim]
+                    
+                    # Align sequence length to match num_aux_tokens
+                    aux_tokens = self._align_sequence_length(projected_hs, num_aux_tokens)
+                    aux_tokens = aux_tokens.to(device=image.device, dtype=image.dtype)
+                else:
+                    # Fallback to random tokens
+                    aux_tokens = generate_random_tokens(
+                        batch_size=1,
+                        seq_length=num_aux_tokens,
+                        hidden_dim=self._config.hidden_size,
+                        distribution='gaussian',
+                        std=0.02,
+                        device=image.device,
+                        dtype=image.dtype
+                    )
                 auxiliary_tokens_list.append(aux_tokens)
             
             # Process each image individually
@@ -345,15 +427,25 @@ class DualVisionTower(nn.Module):
                 image_features.append(features)
         else:
             # Batch processing
-            auxiliary_tokens = generate_random_tokens(
-                batch_size=batch_size,
-                seq_length=num_aux_tokens,
-                hidden_dim=self._config.hidden_size,
-                distribution='gaussian',
-                std=0.02,
-                device=images.device,
-                dtype=images.dtype
-            )
+            if use_text_hidden_states:
+                # Project text hidden states to vision hidden dimension
+                # text_hidden_states: [batch_size, seq_len, llm_hidden_dim]
+                projected_hs = self.llm_hidden_proj(text_hidden_states)  # [batch_size, seq_len, vision_hidden_dim]
+                
+                # Align sequence length to match num_aux_tokens
+                auxiliary_tokens = self._align_sequence_length(projected_hs, num_aux_tokens)
+                auxiliary_tokens = auxiliary_tokens.to(device=images.device, dtype=images.dtype)
+            else:
+                # Fallback to random tokens
+                auxiliary_tokens = generate_random_tokens(
+                    batch_size=batch_size,
+                    seq_length=num_aux_tokens,
+                    hidden_dim=self._config.hidden_size,
+                    distribution='gaussian',
+                    std=0.02,
+                    device=images.device,
+                    dtype=images.dtype
+                )
             
             # Forward through dual encoder
             output = self.vision_tower(
