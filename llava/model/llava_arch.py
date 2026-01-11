@@ -160,16 +160,29 @@ class LlavaMetaForCausalLM(ABC):
     def get_vision_tower(self):
         return self.get_model().get_vision_tower()
 
-    def _get_text_hidden_states(self, input_ids, attention_mask=None):
-        """Get LLM hidden states for text tokens (excluding IMAGE_TOKEN).
+    def _get_text_hidden_states(self, input_ids, attention_mask=None, labels=None):
+        """Get LLM hidden states for non-target text tokens only (to avoid information leakage).
         
-        This method runs a forward pass through the LLM to get hidden states
-        for the text portion of the input, which can be used as auxiliary
-        input for the dual vision tower.
+        IMPORTANT: To avoid information leakage during training, we only use
+        text tokens that are NOT part of the training target. This is determined by:
+        
+        1. If labels are provided: Use tokens where labels == IGNORE_INDEX
+           (these are masked tokens that the model doesn't predict)
+        2. If no labels: Fall back to using only tokens BEFORE the first IMAGE_TOKEN
+           (conservative approach that ensures safety)
+        
+        Training data format (v1): 
+            [系统提示] USER: <image>\n[问题] ASSISTANT: [回复]
+            ↑----- IGNORE_INDEX -----↑        ↑-- TARGET --↑
+        
+        We use tokens where labels == IGNORE_INDEX, excluding IMAGE_TOKEN itself.
+        This includes system prompt + user question, but NOT the assistant response.
         
         Args:
             input_ids: Input token IDs [batch_size, seq_length]
             attention_mask: Optional attention mask [batch_size, seq_length]
+            labels: Optional labels tensor [batch_size, seq_length]. 
+                    Tokens with label == IGNORE_INDEX are safe to use.
             
         Returns:
             text_hidden_states: List of hidden states for each batch item,
@@ -181,25 +194,50 @@ class LlavaMetaForCausalLM(ABC):
         for batch_idx in range(batch_size):
             cur_input_ids = input_ids[batch_idx]
             
-            # Find non-image token positions
-            non_image_mask = cur_input_ids != IMAGE_TOKEN_INDEX
-            
-            # Also filter out padding tokens if attention_mask is provided
-            if attention_mask is not None:
-                cur_attention_mask = attention_mask[batch_idx]
-                non_image_mask = non_image_mask & cur_attention_mask.bool()
-            
-            # Get text token IDs (excluding image tokens)
-            text_token_ids = cur_input_ids[non_image_mask]
+            if labels is not None:
+                # Use labels to determine which tokens are safe (not training targets)
+                cur_labels = labels[batch_idx]
+                
+                # Safe tokens: labels == IGNORE_INDEX (not a prediction target)
+                # Also exclude IMAGE_TOKEN and padding
+                safe_mask = (cur_labels == IGNORE_INDEX) & (cur_input_ids != IMAGE_TOKEN_INDEX)
+                
+                if attention_mask is not None:
+                    safe_mask = safe_mask & attention_mask[batch_idx].bool()
+                
+                text_token_ids = cur_input_ids[safe_mask]
+            else:
+                # Fallback: use only tokens BEFORE the first IMAGE_TOKEN (conservative)
+                image_token_positions = (cur_input_ids == IMAGE_TOKEN_INDEX).nonzero(as_tuple=True)[0]
+                
+                if len(image_token_positions) == 0:
+                    # No image token found, use all non-padding tokens
+                    if attention_mask is not None:
+                        valid_mask = attention_mask[batch_idx].bool()
+                        text_token_ids = cur_input_ids[valid_mask]
+                    else:
+                        text_token_ids = cur_input_ids
+                else:
+                    # Get the first image token position
+                    first_image_pos = image_token_positions[0].item()
+                    
+                    # Only use tokens BEFORE the image token
+                    text_token_ids = cur_input_ids[:first_image_pos]
+                    
+                    # Filter out padding tokens if attention_mask is provided
+                    if attention_mask is not None and first_image_pos > 0:
+                        cur_attention_mask = attention_mask[batch_idx][:first_image_pos]
+                        valid_mask = cur_attention_mask.bool()
+                        text_token_ids = text_token_ids[valid_mask]
             
             if len(text_token_ids) == 0:
-                # No text tokens, create a dummy hidden state
+                # No safe text tokens, create a dummy hidden state
                 hidden_dim = self.config.hidden_size
                 dummy_hs = torch.zeros(1, 1, hidden_dim, device=input_ids.device, dtype=self.dtype)
                 text_hidden_states_list.append(dummy_hs)
                 continue
             
-            # Get embeddings for text tokens
+            # Get embeddings for safe text tokens
             text_embeds = self.get_model().embed_tokens(text_token_ids.unsqueeze(0))  # [1, text_len, hidden_dim]
             
             # Run through the LLM to get hidden states
@@ -251,10 +289,11 @@ class LlavaMetaForCausalLM(ABC):
             return input_ids, position_ids, attention_mask, past_key_values, None, labels
 
         # Get text hidden states for DualVisionTower if applicable
+        # IMPORTANT: Pass labels to avoid information leakage (only use tokens where labels == IGNORE_INDEX)
         text_hidden_states = None
         if hasattr(vision_tower, 'llm_hidden_proj') and vision_tower.llm_hidden_proj is not None:
             # print("Getting text hidden states for DualVisionTower")
-            text_hidden_states = self._get_text_hidden_states(input_ids, attention_mask)
+            text_hidden_states = self._get_text_hidden_states(input_ids, attention_mask, labels=labels)
 
         if type(images) is list or images.ndim == 5:
             if type(images) is list:
