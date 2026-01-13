@@ -73,32 +73,37 @@ class DualVisionTower(nn.Module):
         self.attention_mode = getattr(args, 'dual_vision_attention_mode', 'joint')  # 'joint' or 'cross'
         self.adaptation_checkpoint = getattr(args, 'dual_vision_adaptation_ckpt', None)  # Path to adaptation trained weights
         
-        # LLM hidden state projection layer (will be initialized when set_llm_hidden_size is called)
+        # LLM hidden state projection layer
         self.llm_hidden_proj = None
         self.llm_hidden_size = None
         
-        # Image processor will be set when loading model
-        self.image_processor = None
+        # Create vision_tower and image_processor in __init__ (like CAVEEncoderTower)
+        # This ensures they are registered as submodules and handled by HuggingFace device_map
+        self._create_vision_tower_and_processor()
         
+        # Initialize llm_hidden_proj in __init__ so HuggingFace can load weights automatically
+        # args is the model config which contains hidden_size (LLM hidden dimension)
+        llm_hidden_size = getattr(args, 'hidden_size', None)
+        if llm_hidden_size is not None:
+            self.set_llm_hidden_size(llm_hidden_size)
+        
+        # Load weights if not delay_load
         if not delay_load:
             self.load_model()
         elif getattr(args, 'unfreeze_mm_vision_tower', False):
             self.load_model()
     
-    def load_model(self, device_map=None):
-        if self.is_loaded:
-            print('{} is already loaded, `load_model` called again, skipping.'.format(self.vision_tower_name))
-            return
+    def _create_vision_tower_and_processor(self):
+        """Create vision_tower and image_processor based on encoder_type.
         
-        print(f"Loading Dual Vision Tower: encoder_type={self.encoder_type}, pretrained={self.pretrained_path}")
-        
-        # Load pretrained model to get config
-        from transformers import CLIPVisionModel, CLIPVisionConfig, CLIPImageProcessor
+        This is called in __init__ to ensure vision_tower is a registered submodule,
+        allowing HuggingFace's device_map to handle device placement automatically.
+        """
+        print(f"Creating Dual Vision Tower: encoder_type={self.encoder_type}, pretrained={self.pretrained_path}")
         
         if self.encoder_type == 'clip':
             # Load CLIP config
-            clip_model = CLIPVisionModel.from_pretrained(self.pretrained_path)
-            clip_config = clip_model.config
+            clip_config = CLIPVisionConfig.from_pretrained(self.pretrained_path)
             
             # Create DualVisionConfig from CLIP config
             config = DualVisionConfig(
@@ -128,12 +133,11 @@ class DualVisionTower(nn.Module):
             
         elif self.encoder_type == 'siglip':
             try:
-                from transformers import SiglipVisionModel, SiglipVisionConfig, SiglipImageProcessor
+                from transformers import SiglipVisionConfig, SiglipImageProcessor
                 from dual_vision import DualSigLIPVisionEncoder
                 
                 # Load SigLIP config
-                siglip_model = SiglipVisionModel.from_pretrained(self.pretrained_path)
-                siglip_config = siglip_model.config
+                siglip_config = SiglipVisionConfig.from_pretrained(self.pretrained_path)
                 
                 # Create DualVisionConfig
                 config = DualVisionConfig(
@@ -165,12 +169,11 @@ class DualVisionTower(nn.Module):
         
         elif self.encoder_type == 'vit':
             try:
-                from transformers import ViTModel, ViTConfig, ViTImageProcessor
+                from transformers import ViTConfig, ViTImageProcessor
                 from dual_vision import DualViTEncoder
                 
                 # Load ViT config
-                vit_model = ViTModel.from_pretrained(self.pretrained_path)
-                vit_config = vit_model.config
+                vit_config = ViTConfig.from_pretrained(self.pretrained_path)
                 
                 # Create DualVisionConfig
                 config = DualVisionConfig(
@@ -203,6 +206,19 @@ class DualVisionTower(nn.Module):
         else:
             raise ValueError(f"Unsupported encoder type: {self.encoder_type}")
         
+        print(f"Dual Vision Tower structure created: {self.vision_tower_name}")
+    
+    def load_model(self, device_map=None):
+        """Load pretrained weights into the vision_tower.
+        
+        Note: vision_tower is already created in __init__, this only loads weights.
+        """
+        if self.is_loaded:
+            print('{} is already loaded, `load_model` called again, skipping.'.format(self.vision_tower_name))
+            return
+        
+        print(f"Loading weights for Dual Vision Tower: {self.vision_tower_name}")
+        
         # Set requires_grad based on configuration
         if not self.train_right_branch:
             # Don't freeze by default (let LLaVA training script decide)
@@ -218,7 +234,7 @@ class DualVisionTower(nn.Module):
             self.vision_tower.load_pretrained_weights(self.pretrained_path, strict=False)
         
         self.is_loaded = True
-        print(f"Dual Vision Tower loaded successfully: {self.vision_tower_name}")
+        print(f"Dual Vision Tower weights loaded successfully: {self.vision_tower_name}")
     
     def load_adaptation_weights(self, checkpoint_path):
         """Load weights from adaptation training checkpoint.
