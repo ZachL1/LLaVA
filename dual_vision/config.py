@@ -57,7 +57,8 @@ class DualVisionConfig:
     
     # MoT-specific
     use_qk_norm: bool = False
-    auxiliary_token_init: Literal['random', 'gaussian', 'uniform'] = 'gaussian'
+    use_learnable_tokens: bool = True  # Use learnable auxiliary tokens instead of random
+    auxiliary_token_init: Literal['random', 'gaussian', 'uniform'] = 'gaussian'  # Only used when use_learnable_tokens=False
     random_token_std: float = 0.02
     attention_mode: Literal['joint', 'cross'] = 'joint'  # joint: both branches attend to each other; cross: right queries left
     

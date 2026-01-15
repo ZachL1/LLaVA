@@ -149,6 +149,14 @@ class DualVisionEncoder(nn.Module):
                 config.num_positions, config.hidden_size
             )
         
+        # Learnable auxiliary tokens for right branch (default input when no auxiliary_tokens provided)
+        if config.use_learnable_tokens:
+            self.learnable_auxiliary_tokens = nn.Parameter(
+                torch.zeros(1, config.num_patches, config.hidden_size)
+            )
+            # Initialize with normal distribution (like other learnable embeddings)
+            nn.init.normal_(self.learnable_auxiliary_tokens, mean=0.0, std=config.random_token_std)
+        
         # Pre-layer norms (applied to embeddings before transformer layers)
         # CLIP applies layer norm to combined patch+position embeddings before encoder
         self.pre_layrnorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
@@ -234,17 +242,23 @@ class DualVisionEncoder(nn.Module):
         # ===== Right branch (auxiliary tokens) =====
         # Generate or use provided auxiliary tokens
         if auxiliary_tokens is None:
-            # Generate random tokens matching the left branch sequence length
-            seq_len = left_embeddings.shape[1]
-            auxiliary_tokens = generate_random_tokens(
-                batch_size=batch_size,
-                seq_length=seq_len,
-                hidden_dim=self.config.hidden_size,
-                distribution=self.config.auxiliary_token_init,
-                std=self.config.random_token_std,
-                device=pixel_values.device,
-                dtype=pixel_values.dtype
-            )
+            # Use learnable tokens as default (replaces random tokens)
+            if self.config.use_learnable_tokens and hasattr(self, 'learnable_auxiliary_tokens'):
+                # Expand learnable tokens to batch size
+                auxiliary_tokens = self.learnable_auxiliary_tokens.expand(batch_size, -1, -1)
+                auxiliary_tokens = auxiliary_tokens.to(device=pixel_values.device, dtype=pixel_values.dtype)
+            else:
+                # Fallback to random tokens
+                seq_len = left_embeddings.shape[1]
+                auxiliary_tokens = generate_random_tokens(
+                    batch_size=batch_size,
+                    seq_length=seq_len,
+                    hidden_dim=self.config.hidden_size,
+                    distribution=self.config.auxiliary_token_init,
+                    std=self.config.random_token_std,
+                    device=pixel_values.device,
+                    dtype=pixel_values.dtype
+                )
         else:
             # Pad or truncate to match left branch length
             target_len = left_embeddings.shape[1]

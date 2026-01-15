@@ -10,7 +10,6 @@ from cave.cave_with_vae import CAVEWithVAE
 # Import dual_vision modules
 try:
     from dual_vision import DualCLIPVisionEncoder, DualVisionConfig
-    from dual_vision.utils import generate_random_tokens
     DUAL_VISION_AVAILABLE = True
 except ImportError:
     DUAL_VISION_AVAILABLE = False
@@ -350,6 +349,28 @@ class DualVisionTower(nn.Module):
             last_token = hidden_states[:, -1:, :].expand(-1, padding_length, -1)
             return torch.cat([hidden_states, last_token], dim=1)
     
+    def _get_learnable_auxiliary_tokens(self, batch_size, device, dtype):
+        """Get learnable auxiliary tokens from the vision tower.
+        
+        Args:
+            batch_size: Batch size for expansion
+            device: Target device
+            dtype: Target dtype
+            
+        Returns:
+            Learnable auxiliary tokens [batch_size, num_patches, hidden_dim]
+        """
+        if hasattr(self.vision_tower, 'learnable_auxiliary_tokens'):
+            # Expand learnable tokens to batch size
+            learnable_tokens = self.vision_tower.learnable_auxiliary_tokens.expand(batch_size, -1, -1)
+            return learnable_tokens.to(device=device, dtype=dtype)
+        else:
+            # Fallback to zeros if learnable tokens not available
+            return torch.zeros(
+                batch_size, self._config.num_patches, self._config.hidden_size,
+                device=device, dtype=dtype
+            )
+    
     @torch.no_grad()
     def forward(self, images, text_hidden_states=None):
         """Forward pass through dual vision tower.
@@ -359,7 +380,8 @@ class DualVisionTower(nn.Module):
             text_hidden_states: Optional LLM hidden states for right branch input.
                 - If provided as a tensor: [batch_size, seq_length, llm_hidden_dim]
                 - If provided as a list: list of [1, seq_length, llm_hidden_dim] tensors
-                - If None: falls back to random tokens
+                - If None: uses learnable tokens only (from the encoder)
+                - When provided: learnable tokens + projected text hidden states
             
         Returns:
             Image features based on output_mode setting
@@ -370,13 +392,10 @@ class DualVisionTower(nn.Module):
         if self.num_auxiliary_tokens is None:
             # Default: same as number of image patches
             num_aux_tokens = self._config.num_patches
-            if self._config.use_cls_token:
-                num_aux_tokens += 1
         else:
             num_aux_tokens = self.num_auxiliary_tokens
         
-        # Prepare auxiliary tokens for right branch
-        # Use LLM hidden states if provided, otherwise fall back to random tokens
+        # Check if we can use text hidden states
         use_text_hidden_states = (
             text_hidden_states is not None and 
             self.llm_hidden_proj is not None
@@ -387,6 +406,13 @@ class DualVisionTower(nn.Module):
             auxiliary_tokens_list = []
             
             for idx, image in enumerate(images):
+                # Start with learnable tokens as base
+                learnable_tokens = self._get_learnable_auxiliary_tokens(
+                    batch_size=1, 
+                    device=image.device, 
+                    dtype=image.dtype
+                )  # [1, num_patches, hidden_dim]
+                
                 if use_text_hidden_states:
                     # Get text hidden states for this image
                     if isinstance(text_hidden_states, list):
@@ -398,19 +424,15 @@ class DualVisionTower(nn.Module):
                     projected_hs = self.llm_hidden_proj(text_hs)  # [1, seq_len, vision_hidden_dim]
                     
                     # Align sequence length to match num_aux_tokens
-                    aux_tokens = self._align_sequence_length(projected_hs, num_aux_tokens)
-                    aux_tokens = aux_tokens.to(device=image.device, dtype=image.dtype)
+                    projected_hs = self._align_sequence_length(projected_hs, num_aux_tokens)
+                    projected_hs = projected_hs.to(device=image.device, dtype=image.dtype)
+                    
+                    # Combine: learnable tokens + projected text hidden states
+                    aux_tokens = learnable_tokens + projected_hs
                 else:
-                    # Fallback to random tokens
-                    aux_tokens = generate_random_tokens(
-                        batch_size=1,
-                        seq_length=num_aux_tokens,
-                        hidden_dim=self._config.hidden_size,
-                        distribution='gaussian',
-                        std=0.02,
-                        device=image.device,
-                        dtype=image.dtype
-                    )
+                    # Use learnable tokens only (encoder will use them as default)
+                    aux_tokens = None  # Let encoder use its learnable tokens
+                
                 auxiliary_tokens_list.append(aux_tokens)
             
             # Process each image individually
@@ -444,24 +466,26 @@ class DualVisionTower(nn.Module):
         else:
             # Batch processing
             if use_text_hidden_states:
+                # Start with learnable tokens as base
+                learnable_tokens = self._get_learnable_auxiliary_tokens(
+                    batch_size=batch_size, 
+                    device=images.device, 
+                    dtype=images.dtype
+                )  # [batch_size, num_patches, hidden_dim]
+                
                 # Project text hidden states to vision hidden dimension
                 # text_hidden_states: [batch_size, seq_len, llm_hidden_dim]
                 projected_hs = self.llm_hidden_proj(text_hidden_states)  # [batch_size, seq_len, vision_hidden_dim]
                 
                 # Align sequence length to match num_aux_tokens
-                auxiliary_tokens = self._align_sequence_length(projected_hs, num_aux_tokens)
-                auxiliary_tokens = auxiliary_tokens.to(device=images.device, dtype=images.dtype)
+                projected_hs = self._align_sequence_length(projected_hs, num_aux_tokens)
+                projected_hs = projected_hs.to(device=images.device, dtype=images.dtype)
+                
+                # Combine: learnable tokens + projected text hidden states
+                auxiliary_tokens = learnable_tokens + projected_hs
             else:
-                # Fallback to random tokens
-                auxiliary_tokens = generate_random_tokens(
-                    batch_size=batch_size,
-                    seq_length=num_aux_tokens,
-                    hidden_dim=self._config.hidden_size,
-                    distribution='gaussian',
-                    std=0.02,
-                    device=images.device,
-                    dtype=images.dtype
-                )
+                # Use learnable tokens only (encoder will use them as default)
+                auxiliary_tokens = None  # Let encoder use its learnable tokens
             
             # Forward through dual encoder
             output = self.vision_tower(
