@@ -237,20 +237,25 @@ def evaluate(model, teacher, dataloader, device, loss_type: str, encoder_type: s
         # Forward through student
         outputs = model(images, return_dict=True)
         student_output = outputs['pooled_output']
+        student_hidden_state = outputs['right_last_hidden_state'] # B x L(1+T) x D
         
         # Forward through teacher
         if encoder_type == 'vit':
             teacher_outputs = teacher(images)
             teacher_output = teacher_outputs.last_hidden_state[:, 0]
+            teacher_hidden_state = teacher_outputs.last_hidden_state
         elif encoder_type == 'clip':
             teacher_outputs = teacher(images)
+            teacher_hidden_state = teacher_outputs.last_hidden_state
             teacher_output = teacher_outputs.pooler_output
         elif encoder_type == 'siglip':
             teacher_outputs = teacher(images)
+            teacher_hidden_state = teacher_outputs.last_hidden_state
             teacher_output = teacher_outputs.pooler_output
         
         # Compute loss
-        loss = compute_alignment_loss(student_output, teacher_output, loss_type)
+        # loss = compute_alignment_loss(student_output, teacher_output, loss_type)
+        loss = compute_alignment_loss(student_hidden_state, teacher_hidden_state, loss_type)
         
         total_loss += loss.item()
         num_batches += 1
