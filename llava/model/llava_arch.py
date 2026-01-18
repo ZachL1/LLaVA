@@ -99,6 +99,8 @@ class LlavaMetaModel:
             vision_tower.set_llm_hidden_size(llm_hidden_size)
             print(f"Initialized DualVisionTower with LLM hidden size: {llm_hidden_size}")
 
+        if getattr(self, 'mm_projector', None):
+            del self.mm_projector
         if getattr(self, 'mm_projector', None) is None:
             self.mm_projector = build_vision_projector(self.config)
 
@@ -115,7 +117,13 @@ class LlavaMetaModel:
         if pretrain_mm_mlp_adapter is not None:
             mm_projector_weights = torch.load(pretrain_mm_mlp_adapter, map_location='cpu')
             def get_w(weights, keyword):
-                return {k.split(keyword + '.')[1]: v for k, v in weights.items() if keyword in k}
+                return {k.partition(keyword + '.')[-1]: v for k, v in weights.items() if keyword in k}
+
+            self.mm_projector.load_state_dict(get_w(mm_projector_weights, 'mm_projector'))
+            # if vision_tower in mm_projector_weights keys
+            if any("vision_tower" in key for key in mm_projector_weights):
+                print("Loading vision tower state dict")
+                self.vision_tower.load_state_dict(get_w(mm_projector_weights, 'vision_tower'))
 
             self.mm_projector.load_state_dict(get_w(mm_projector_weights, 'mm_projector'))
 
@@ -264,7 +272,7 @@ class LlavaMetaForCausalLM(ABC):
         
         Args:
             images: Image tensor or list of image tensors
-            text_hidden_states: Optional list of LLM hidden states for dual vision tower
+            text_hidden_states: Optional list of LLM hidden states for dual/controlnet vision tower
             
         Returns:
             Image features after projection

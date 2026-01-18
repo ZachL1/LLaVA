@@ -1,11 +1,15 @@
 import os
 from .clip_encoder import CLIPVisionTower, CLIPVisionTowerS2, CAVEEncoderTower, DualVisionTower
+from .controlnet_encoder import ControlNetVisionTower
 
 
 def build_vision_tower(vision_tower_cfg, **kwargs):
     vision_tower = getattr(vision_tower_cfg, 'mm_vision_tower', getattr(vision_tower_cfg, 'vision_tower', None))
     is_absolute_path_exists = os.path.exists(vision_tower)
     use_s2 = getattr(vision_tower_cfg, 's2', False)
+    
+    if vision_tower.startswith("controlnet_vision"):
+        return ControlNetVisionTower(vision_tower, args=vision_tower_cfg, **kwargs)
     
     if vision_tower.startswith("dual_vision"):
         return DualVisionTower(vision_tower, args=vision_tower_cfg, **kwargs)

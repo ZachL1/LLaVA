@@ -75,6 +75,9 @@ class ModelArguments:
     dual_vision_flash_attn: bool = field(default=True)
     dual_vision_attention_mode: Optional[str] = field(default='joint')
     dual_vision_adaptation_ckpt: Optional[str] = field(default=None)
+    # ControlNet Vision Tower parameters
+    controlnet_vision_pretrained: Optional[str] = field(default=None)
+    # tune_controlnet_vision: bool = field(default=True)  # Train right branch + zero fusion + text_proj
 
 
 @dataclass
@@ -199,7 +202,7 @@ def safe_save_model_for_hf_trainer(trainer: transformers.Trainer,
 
     if getattr(trainer.args, "tune_mm_mlp_adapter", False):
         # Only save Adapter
-        keys_to_match = ['mm_projector']
+        keys_to_match = ['mm_projector', 'vision_tower']
         if getattr(trainer.args, "use_im_start_end", False):
             keys_to_match.extend(['embed_tokens', 'embed_in'])
 
@@ -940,6 +943,10 @@ def train(attn_implementation=None):
             model.requires_grad_(False)
             for p in model.get_model().mm_projector.parameters():
                 p.requires_grad = True
+        
+        if model_args.dual_vision_train_right:
+            model.get_model().vision_tower.requires_grad_(True)
+            model.get_model().vision_tower.vision_tower.freeze_left_branch()
 
         model.config.freeze_mm_mlp_adapter = training_args.freeze_mm_mlp_adapter
         if training_args.freeze_mm_mlp_adapter:
@@ -967,6 +974,9 @@ def train(attn_implementation=None):
                 if hasattr(module, 'weight'):
                     if training_args.bf16 and module.weight.dtype == torch.float32:
                         module = module.to(torch.bfloat16)
+
+    # log the trainable parameters keys
+    rank0_print(f"Trainable parameters: {[n for n, p in model.named_parameters() if p.requires_grad]}")
 
     data_module = make_supervised_data_module(tokenizer=tokenizer,
                                               data_args=data_args)

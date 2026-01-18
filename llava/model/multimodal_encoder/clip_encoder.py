@@ -413,6 +413,9 @@ class DualVisionTower(nn.Module):
                     dtype=image.dtype
                 )  # [1, num_patches, hidden_dim]
                 
+                # # Align learnable tokens to num_aux_tokens (may differ from num_patches)
+                # learnable_tokens = self._align_sequence_length(learnable_tokens, num_aux_tokens)
+                
                 if use_text_hidden_states:
                     # Get text hidden states for this image
                     if isinstance(text_hidden_states, list):
@@ -430,8 +433,8 @@ class DualVisionTower(nn.Module):
                     # Combine: learnable tokens + projected text hidden states
                     aux_tokens = learnable_tokens + projected_hs
                 else:
-                    # Use learnable tokens only (encoder will use them as default)
-                    aux_tokens = None  # Let encoder use its learnable tokens
+                    # Use learnable tokens only
+                    aux_tokens = learnable_tokens
                 
                 auxiliary_tokens_list.append(aux_tokens)
             
@@ -465,14 +468,17 @@ class DualVisionTower(nn.Module):
                 image_features.append(features)
         else:
             # Batch processing
+            # Start with learnable tokens as base
+            learnable_tokens = self._get_learnable_auxiliary_tokens(
+                batch_size=batch_size, 
+                device=images.device, 
+                dtype=images.dtype
+            )  # [batch_size, num_patches, hidden_dim]
+            
+            # # Align learnable tokens to num_aux_tokens (may differ from num_patches)
+            # learnable_tokens = self._align_sequence_length(learnable_tokens, num_aux_tokens)
+            
             if use_text_hidden_states:
-                # Start with learnable tokens as base
-                learnable_tokens = self._get_learnable_auxiliary_tokens(
-                    batch_size=batch_size, 
-                    device=images.device, 
-                    dtype=images.dtype
-                )  # [batch_size, num_patches, hidden_dim]
-                
                 # Project text hidden states to vision hidden dimension
                 # text_hidden_states: [batch_size, seq_len, llm_hidden_dim]
                 projected_hs = self.llm_hidden_proj(text_hidden_states)  # [batch_size, seq_len, vision_hidden_dim]
@@ -484,8 +490,8 @@ class DualVisionTower(nn.Module):
                 # Combine: learnable tokens + projected text hidden states
                 auxiliary_tokens = learnable_tokens + projected_hs
             else:
-                # Use learnable tokens only (encoder will use them as default)
-                auxiliary_tokens = None  # Let encoder use its learnable tokens
+                # Use learnable tokens only
+                auxiliary_tokens = learnable_tokens
             
             # Forward through dual encoder
             output = self.vision_tower(
