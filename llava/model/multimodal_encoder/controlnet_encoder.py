@@ -468,14 +468,16 @@ class ControlNetVisionEncoder(nn.Module):
             # Add fusion to left branch
             left_hidden = left_hidden + fusion_output
         
-        # Final layer norm
-        last_hidden_state = self.final_layernorm(left_hidden)
+        # CLIP's last_hidden_state is BEFORE post_layernorm
+        # post_layernorm is only applied to pooled output (CLS token)
+        last_hidden_state = left_hidden
         
         if output_hidden_states:
             all_hidden_states.append(last_hidden_state)
         
-        # Pooler output (CLS token)
-        pooler_output = last_hidden_state[:, 0]
+        # Pooler output: extract CLS token and apply final layer norm
+        # (matching CLIP's implementation where post_layernorm is only applied to pooled output)
+        pooler_output = self.final_layernorm(left_hidden[:, 0])
         
         return {
             'last_hidden_state': last_hidden_state,
