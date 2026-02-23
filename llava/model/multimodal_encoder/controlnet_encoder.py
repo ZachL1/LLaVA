@@ -5,25 +5,39 @@ Design:
 - Left branch: Frozen pretrained vision encoder (CLIP/SigLIP)
 - Right branch: Trainable text-conditioned processor (only receives text hidden states)
 - Zero fusion: Cross-attention based fusion with zero-initialized output projection
+- Single stream fusion: Flux-style combined-stream blocks after all double-stream layers
 - Output: Left branch output (gradually influenced by right branch during training)
 
 Architecture:
-    Input Image ──────────────────────────────────────► Left Branch (Frozen)
-                                                              │
-    Text Hidden State ──► llm_hidden_proj ──► Right Branch (Trainable)
-                                              │               │
-                                              │               │
-    For each layer i:                         ▼               ▼
-                                        right_layer_i   left_layer_i
-                                              │               │
-                                              ▼               │
-                                        zero_fusion_i         │
-                                        (cross-attn)          │
-                                              │               │
-                                              └──────► (+) ◄──┘
+
+  ┌──── DOUBLE STREAM PHASE (num_hidden_layers) ────────────────────────────┐
+  │                                                                          │
+  │  Input Image ──────────────────────────────────────► Left Branch (Frozen)│
+  │                                                              │           │
+  │  Text Hidden State ──► llm_hidden_proj ──► Right Branch (Trainable)     │
+  │                                              │               │           │
+  │  For each layer i:                           ▼               ▼           │
+  │                                        right_layer_i   left_layer_i     │
+  │                                              │               │           │
+  │                                              ▼               │           │
+  │                                        zero_fusion_i         │           │
+  │                                        (cross-attn)          │           │
+  │                                              │               │           │
+  │                                              └──────► (+) ◄──┘           │
+  │                                                       │                  │
+  │                                                  left_hidden             │
+  └──────────────────────────────────────────────────────────────────────────┘
                                                        │
-                                                       ▼
-                                                 left_hidden
+                  ┌── SINGLE STREAM PHASE (num_single_stream_layers) ────────┐
+                  │                                                           │
+                  │  combined = cat([right_hidden, left_hidden], dim=1)      │
+                  │                                                           │
+                  │  For each block j:  combined = SingleStreamFusionBlock(combined)
+                  │  (joint full-sequence self-attn + parallel MLP,          │
+                  │   zero-initialized, mirrors Flux's Fused DIT blocks)     │
+                  │                                                           │
+                  │  left_hidden = combined[:, txt_len:]                     │
+                  └───────────────────────────────────────────────────────────┘
                                                        │
                                                        ▼
                                                Final Output
@@ -240,6 +254,96 @@ class ZeroCrossAttentionFusion(nn.Module):
 
 
 # ============================================================================
+# Single Stream Fusion Block (Flux-style)
+# ============================================================================
+
+class SingleStreamFusionBlock(nn.Module):
+    """
+    Flux-style single stream block with parallel attention + MLP.
+
+    After the per-layer double-stream processing (left vision + right text),
+    this block operates on the *concatenated* sequence [txt_tokens, img_tokens]
+    so that both modalities attend to each other jointly through a single set
+    of shared weights — mirroring Flux's "Fused DIT / Combined Stream" blocks.
+
+    Key design choices (matching Flux):
+    - linear1 projects to (QKV + MLP_hidden) in one shot → two parallel streams
+    - linear2 merges [attn_output, act(mlp_hidden)] → final residual update
+    - linear2 is **zero-initialized** so the block starts as an identity,
+      consistent with the ControlNet zero-initialization philosophy
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        num_heads: int,
+        mlp_ratio: float = 4.0,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.num_heads = num_heads
+        self.head_dim = hidden_size // num_heads
+        self.mlp_hidden_dim = int(hidden_size * mlp_ratio)
+        self.scale = self.head_dim ** -0.5
+
+        self.pre_norm = nn.LayerNorm(hidden_size, eps=1e-6)
+
+        # QKV + MLP input in one fused projection (parallel streams)
+        self.linear1 = nn.Linear(hidden_size, hidden_size * 3 + self.mlp_hidden_dim)
+        # Merge attention output and activated MLP stream → residual
+        self.linear2 = nn.Linear(hidden_size + self.mlp_hidden_dim, hidden_size)
+
+        self.mlp_act = nn.GELU(approximate="tanh")
+        self.attn_drop = nn.Dropout(dropout)
+
+        # Zero-init: block starts as identity (ControlNet-style training stability)
+        nn.init.zeros_(self.linear2.weight)
+        nn.init.zeros_(self.linear2.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: Combined [txt, img] token sequence [B, L_txt + L_img, hidden_size]
+
+        Returns:
+            Updated combined sequence of the same shape.
+        """
+        B, L, _ = x.shape
+
+        x_norm = self.pre_norm(x)
+
+        # Single fused projection → split into QKV and MLP streams
+        qkv, mlp_in = torch.split(
+            self.linear1(x_norm),
+            [3 * self.hidden_size, self.mlp_hidden_dim],
+            dim=-1,
+        )
+
+        # Reshape QKV: [B, num_heads, L, head_dim]
+        q, k, v = (
+            qkv.reshape(B, L, 3, self.num_heads, self.head_dim)
+            .permute(2, 0, 3, 1, 4)
+            .unbind(0)
+        )
+
+        # Attention stream
+        attn_w = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+        attn_w = F.softmax(attn_w, dim=-1)
+        attn_w = self.attn_drop(attn_w)
+        attn_out = torch.matmul(attn_w, v)                              # [B, H, L, D]
+        attn_out = attn_out.transpose(1, 2).contiguous().view(B, L, self.hidden_size)
+
+        # MLP stream (activated in parallel with attention)
+        mlp_out = self.mlp_act(mlp_in)                                  # [B, L, mlp_dim]
+
+        # Merge both streams and project; zero-init ensures identity at init
+        output = self.linear2(torch.cat([attn_out, mlp_out], dim=-1))
+
+        return x + output
+
+
+# ============================================================================
 # ControlNet Vision Encoder
 # ============================================================================
 
@@ -259,6 +363,8 @@ class ControlNetVisionConfig:
         attention_dropout: float = 0.0,
         dropout_prob: float = 0.0,
         max_text_seq_len: int = 2048,  # Max text sequence length for right branch
+        num_single_stream_layers: int = 4,  # Flux-style single-stream fusion blocks after double-stream
+        single_stream_mlp_ratio: float = 4.0,
     ):
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
@@ -271,6 +377,8 @@ class ControlNetVisionConfig:
         self.attention_dropout = attention_dropout
         self.dropout_prob = dropout_prob
         self.max_text_seq_len = max_text_seq_len
+        self.num_single_stream_layers = num_single_stream_layers
+        self.single_stream_mlp_ratio = single_stream_mlp_ratio
     
     @property
     def num_patches(self) -> int:
@@ -347,7 +455,21 @@ class ControlNetVisionEncoder(nn.Module):
         self.zero_fusions = nn.ModuleList([
             ZeroCrossAttentionFusion(config) for _ in range(config.num_hidden_layers)
         ])
-        
+
+        # ==================== Single Stream Fusion Blocks (Flux-style) ====================
+        # After all double-stream layers, txt and img tokens are concatenated and
+        # processed jointly by these blocks — mirroring Flux's "Combined Stream".
+        # Each block is zero-initialized so it starts as identity.
+        self.single_stream_blocks = nn.ModuleList([
+            SingleStreamFusionBlock(
+                hidden_size=config.hidden_size,
+                num_heads=config.num_attention_heads,
+                mlp_ratio=config.single_stream_mlp_ratio,
+                dropout=config.attention_dropout,
+            )
+            for _ in range(config.num_single_stream_layers)
+        ])
+
         # Initialize weights
         self._init_weights()
     
@@ -384,19 +506,23 @@ class ControlNetVisionEncoder(nn.Module):
         print("Left branch frozen successfully")
     
     def get_trainable_parameters(self):
-        """Get list of trainable parameters (right branch + zero fusions)."""
+        """Get list of trainable parameters (right branch + zero fusions + single stream blocks)."""
         trainable = []
-        
+
         # Right branch
         trainable.extend(self.right_pos_embedding.parameters())
         trainable.extend(self.right_pre_layernorm.parameters())
         for layer in self.right_layers:
             trainable.extend(layer.parameters())
-        
-        # Zero fusions
+
+        # Zero fusions (per double-stream layer)
         for fusion in self.zero_fusions:
             trainable.extend(fusion.parameters())
-        
+
+        # Single stream fusion blocks (Flux-style combined stream)
+        for block in self.single_stream_blocks:
+            trainable.extend(block.parameters())
+
         return trainable
     
     def forward(
@@ -468,6 +594,20 @@ class ControlNetVisionEncoder(nn.Module):
             # Add fusion to left branch
             left_hidden = left_hidden + fusion_output
         
+        # ==================== Single Stream Fusion (Flux-style) ====================
+        # Concatenate [txt_tokens, img_tokens] into one combined sequence,
+        # then let the single-stream blocks do joint full-sequence self-attention.
+        # This mirrors how Flux transitions from Double Stream → Combined Stream:
+        #   img = torch.cat((txt, img), 1)
+        #   for block in single_blocks: img = block(img)
+        #   img = img[:, txt_len:]
+        if self.single_stream_blocks:
+            txt_len = right_hidden.shape[1]
+            combined = torch.cat([right_hidden, left_hidden], dim=1)   # [B, L_txt+L_img, H]
+            for block in self.single_stream_blocks:
+                combined = block(combined)
+            left_hidden = combined[:, txt_len:]                        # [B, L_img, H]
+
         # CLIP's last_hidden_state is BEFORE post_layernorm
         # post_layernorm is only applied to pooled output (CLS token)
         last_hidden_state = left_hidden
@@ -570,8 +710,11 @@ class ControlNetVisionEncoder(nn.Module):
         
         print(f"Loaded {len(our_state_dict)} keys into left branch")
         if missing:
-            # Filter out expected missing keys (right branch, zero fusions)
-            unexpected_missing = [k for k in missing if not k.startswith(('right_', 'zero_'))]
+            # Filter out expected missing keys (right branch, zero fusions, single stream blocks)
+            unexpected_missing = [
+                k for k in missing
+                if not k.startswith(('right_', 'zero_', 'single_stream_'))
+            ]
             if unexpected_missing:
                 print(f"Unexpected missing keys: {unexpected_missing[:10]}...")
     
