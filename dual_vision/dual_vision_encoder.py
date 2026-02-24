@@ -7,11 +7,11 @@ import warnings
 
 try:
     from .config import DualVisionConfig
-    from .attention import DualBranchAttention, DualBranchMLP
+    from .attention import DualBranchAttention, DualBranchMLP, SingleStreamFusionBlock
     from .utils import pad_auxiliary_tokens, generate_random_tokens
 except ImportError:
     from config import DualVisionConfig
-    from attention import DualBranchAttention, DualBranchMLP
+    from attention import DualBranchAttention, DualBranchMLP, SingleStreamFusionBlock
     from utils import pad_auxiliary_tokens, generate_random_tokens
 
 
@@ -162,11 +162,20 @@ class DualVisionEncoder(nn.Module):
         self.pre_layrnorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.pre_layrnorm_mot = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         
-        # Transformer layers
+        # Transformer layers (dual-stream / double-stream phase)
         self.layers = nn.ModuleList([
             DualVisionEncoderLayer(config) for _ in range(config.num_layers)
         ])
-        
+
+        # Single stream fusion blocks (Flux-style combined-stream phase).
+        # After all dual-stream layers, left and right tokens are concatenated
+        # into one sequence and processed jointly by these blocks.
+        # Each block is zero-initialized so training starts from a stable baseline.
+        self.single_stream_blocks = nn.ModuleList([
+            SingleStreamFusionBlock(config)
+            for _ in range(config.num_single_stream_layers)
+        ])
+
         # Final layer norms (applied to pooled output)
         self.final_layernorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.final_layernorm_mot = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
@@ -176,6 +185,14 @@ class DualVisionEncoder(nn.Module):
         
         # Initialize weights
         self.apply(self._init_weights)
+
+        # Re-apply zero-init for single stream fusion block output projections.
+        # self.apply() above visits every nn.Linear and resets it to N(0, 0.02),
+        # which would override the zero-initialization done inside each block.
+        for block in self.single_stream_blocks:
+            nn.init.zeros_(block.linear2.weight)
+            if block.linear2.bias is not None:
+                nn.init.zeros_(block.linear2.bias)
     
     def _init_weights(self, module):
         """Initialize weights"""
@@ -190,23 +207,39 @@ class DualVisionEncoder(nn.Module):
             module.data.normal_(mean=0.0, std=0.02)
     
     def freeze_left_branch(self):
-        """Freeze all left branch (image) parameters."""
+        """Freeze all left branch (image) parameters.
+
+        Single stream fusion blocks are intentionally *not* frozen — they are
+        always trainable alongside the right branch.
+        """
         for name, param in self.named_parameters():
-            if '_mot' not in name:
+            if '_mot' not in name and not name.startswith('single_stream_blocks.'):
                 param.requires_grad = False
-    
+
     def unfreeze_all(self):
         """Unfreeze all parameters."""
         for param in self.parameters():
             param.requires_grad = True
-    
+
     def get_left_parameters(self):
-        """Get all left branch parameters (without _mot suffix)."""
-        return [p for n, p in self.named_parameters() if '_mot' not in n and p.requires_grad]
-    
+        """Get trainable left branch parameters (no ``_mot`` suffix, excludes single stream blocks)."""
+        return [
+            p for n, p in self.named_parameters()
+            if '_mot' not in n
+            and not n.startswith('single_stream_blocks.')
+            and p.requires_grad
+        ]
+
     def get_right_parameters(self):
-        """Get all right branch parameters (with _mot suffix)."""
+        """Get trainable right branch parameters (``_mot`` suffix)."""
         return [p for n, p in self.named_parameters() if '_mot' in n and p.requires_grad]
+
+    def get_single_stream_parameters(self):
+        """Get trainable single stream fusion block parameters."""
+        return [
+            p for n, p in self.named_parameters()
+            if n.startswith('single_stream_blocks.') and p.requires_grad
+        ]
     
     def forward(
         self,
@@ -302,7 +335,19 @@ class DualVisionEncoder(nn.Module):
             hidden_states_left, hidden_states_right = layer(
                 hidden_states_left, hidden_states_right
             )
-        
+
+        # ===== Single Stream Fusion (Flux-style combined stream) =====
+        # Concatenate [left_tokens, right_tokens] and process jointly so that
+        # both modalities can attend to each other through a unified sequence.
+        # Mirrors Flux:  combined = cat(txt, img) → single_blocks → split
+        if self.single_stream_blocks:
+            left_len = hidden_states_left.shape[1]
+            combined = torch.cat([hidden_states_left, hidden_states_right], dim=1)
+            for block in self.single_stream_blocks:
+                combined = block(combined)
+            hidden_states_left  = combined[:, :left_len]
+            hidden_states_right = combined[:, left_len:]
+
         # ===== Pooling =====
         # Pool BEFORE final layer norm (matching CLIP's implementation)
         pooled_left = self._pool_features(hidden_states_left)

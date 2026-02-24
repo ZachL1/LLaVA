@@ -368,3 +368,140 @@ class DualBranchMLP(nn.Module):
         hidden_states = self.fc2(hidden_states)
         hidden_states = self.dropout(hidden_states)
         return hidden_states
+
+
+class SingleStreamFusionBlock(nn.Module):
+    """Flux-style single stream block for the DualVisionEncoder combined-stream phase.
+
+    After all dual-stream (double-stream) layers have run, the left (image) and
+    right (auxiliary) token sequences are concatenated into one combined sequence
+    and processed jointly by these blocks — exactly mirroring Flux's transition
+    from Double Stream Blocks → Combined Stream (Fused DIT Blocks).
+
+    Design principles:
+    - ``linear1`` fuses QKV + MLP_hidden into a single projection (parallel streams).
+    - ``linear2`` merges [attn_output, act(mlp_hidden)] into the residual update.
+    - ``linear2`` is **zero-initialized** so each block starts as an identity
+      (consistent with ControlNet / MoT training-stability philosophy).
+    - Flash attention is used when available and inputs are on CUDA.
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        hidden_size = config.hidden_size
+        num_heads = config.num_heads
+        head_dim = config.head_dim
+        mlp_hidden_dim = int(hidden_size * config.single_stream_mlp_ratio)
+
+        self.hidden_size = hidden_size
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.mlp_hidden_dim = mlp_hidden_dim
+        self.scale = head_dim ** -0.5
+        self.use_flash_attention = config.use_flash_attention and FLASH_ATTN_AVAILABLE
+
+        self.pre_norm = nn.LayerNorm(hidden_size, eps=config.layer_norm_eps)
+
+        # One fused projection: QKV (3·H) + MLP input (mlp_dim) in parallel
+        self.linear1 = nn.Linear(hidden_size, hidden_size * 3 + mlp_hidden_dim,
+                                 bias=config.use_bias_in_attention)
+        # Merge attention output + activated MLP stream → residual delta
+        self.linear2 = nn.Linear(hidden_size + mlp_hidden_dim, hidden_size,
+                                 bias=config.use_bias_in_mlp)
+
+        self.mlp_act = nn.GELU(approximate="tanh")
+        self.attn_drop = nn.Dropout(config.attention_dropout_prob)
+
+        # Zero-init: block is identity at init → safe to add without disrupting
+        # the already-trained dual-stream representations.
+        nn.init.zeros_(self.linear2.weight)
+        if self.linear2.bias is not None:
+            nn.init.zeros_(self.linear2.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: Combined token sequence ``[B, L_left + L_right, hidden_size]``
+
+        Returns:
+            Updated combined sequence of the same shape.
+        """
+        B, L, _ = x.shape
+
+        x_norm = self.pre_norm(x)
+
+        # Single fused projection → split into QKV and MLP streams
+        qkv, mlp_in = torch.split(
+            self.linear1(x_norm),
+            [3 * self.hidden_size, self.mlp_hidden_dim],
+            dim=-1,
+        )
+
+        # Reshape to [B, L, num_heads, head_dim] (flash-attn convention)
+        q, k, v = (
+            qkv.reshape(B, L, 3, self.num_heads, self.head_dim)
+            .unbind(dim=2)
+        )
+
+        # Attention stream (flash or standard)
+        attn_out = self._compute_attention(q, k, v)          # [B, L, num_heads, head_dim]
+        attn_out = attn_out.contiguous().view(B, L, self.hidden_size)
+
+        # MLP stream (activated in parallel with attention)
+        mlp_out = self.mlp_act(mlp_in)                       # [B, L, mlp_dim]
+
+        # Merge and project; zero-init ensures identity at the start of training
+        output = self.linear2(torch.cat([attn_out, mlp_out], dim=-1))
+
+        return x + output
+
+    def _compute_attention(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute scaled dot-product attention, using flash attention when possible.
+
+        Args:
+            q, k, v: ``[B, L, num_heads, head_dim]``
+
+        Returns:
+            ``[B, L, num_heads, head_dim]``
+        """
+        use_flash = self.use_flash_attention and q.is_cuda
+
+        if use_flash:
+            original_dtype = q.dtype
+            if original_dtype not in (torch.float16, torch.bfloat16):
+                compute_dtype = (
+                    torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+                )
+                q = q.to(compute_dtype)
+                k = k.to(compute_dtype)
+                v = v.to(compute_dtype)
+
+            attn_out = flash_attn_func(
+                q, k, v,
+                dropout_p=0.0,  # handled separately via self.attn_drop
+                causal=False,
+            )
+
+            if original_dtype not in (torch.float16, torch.bfloat16):
+                attn_out = attn_out.to(original_dtype)
+        else:
+            # Standard scaled dot-product attention
+            # Transpose to [B, num_heads, L, head_dim]
+            q = q.transpose(1, 2)
+            k = k.transpose(1, 2)
+            v = v.transpose(1, 2)
+
+            attn_scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+            attn_probs = F.softmax(attn_scores, dim=-1)
+            attn_probs = self.attn_drop(attn_probs)
+            attn_out = torch.matmul(attn_probs, v)
+
+            # Transpose back to [B, L, num_heads, head_dim]
+            attn_out = attn_out.transpose(1, 2)
+
+        return attn_out

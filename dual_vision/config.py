@@ -80,6 +80,10 @@ class DualVisionConfig:
     # Positional encoding
     use_absolute_position_embeddings: bool = True
     use_cls_token: bool = True
+
+    # Single stream fusion (Flux-style combined stream after dual-stream layers)
+    num_single_stream_layers: int = 4
+    single_stream_mlp_ratio: float = 4.0
     
     def __post_init__(self):
         """Set default values based on encoder type"""

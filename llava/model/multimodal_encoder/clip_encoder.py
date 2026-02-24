@@ -71,6 +71,9 @@ class DualVisionTower(nn.Module):
         self.use_flash_attention = getattr(args, 'dual_vision_flash_attn', True)
         self.attention_mode = getattr(args, 'dual_vision_attention_mode', 'joint')  # 'joint' or 'cross'
         self.adaptation_checkpoint = getattr(args, 'dual_vision_adaptation_ckpt', None)  # Path to adaptation trained weights
+        # Single stream fusion (Flux-style combined stream after dual-stream layers)
+        self.num_single_stream_layers = getattr(args, 'dual_vision_num_single_stream_layers', 4)
+        self.single_stream_mlp_ratio = getattr(args, 'dual_vision_single_stream_mlp_ratio', 4.0)
         
         # LLM hidden state projection layer
         self.llm_hidden_proj = None
@@ -119,6 +122,8 @@ class DualVisionTower(nn.Module):
                 freeze_left_branch=True,
                 use_flash_attention=self.use_flash_attention,
                 attention_mode=self.attention_mode,
+                num_single_stream_layers=self.num_single_stream_layers,
+                single_stream_mlp_ratio=self.single_stream_mlp_ratio,
             )
             
             # Create dual vision encoder
@@ -153,6 +158,8 @@ class DualVisionTower(nn.Module):
                     freeze_left_branch=True,
                     use_flash_attention=self.use_flash_attention,
                     attention_mode=self.attention_mode,
+                    num_single_stream_layers=self.num_single_stream_layers,
+                    single_stream_mlp_ratio=self.single_stream_mlp_ratio,
                 )
                 
                 # Create dual vision encoder
@@ -189,6 +196,8 @@ class DualVisionTower(nn.Module):
                     freeze_left_branch=True,
                     use_flash_attention=self.use_flash_attention,
                     attention_mode=self.attention_mode,
+                    num_single_stream_layers=self.num_single_stream_layers,
+                    single_stream_mlp_ratio=self.single_stream_mlp_ratio,
                 )
                 
                 # Create dual vision encoder
@@ -292,11 +301,13 @@ class DualVisionTower(nn.Module):
         # Count loaded parameters
         loaded_params = len(state_dict)
         right_branch_params = len([k for k in state_dict.keys() if '_mot' in k])
-        left_branch_params = loaded_params - right_branch_params
-        
+        single_stream_params = len([k for k in state_dict.keys() if k.startswith('single_stream_blocks.')])
+        left_branch_params = loaded_params - right_branch_params - single_stream_params
+
         print(f"  - Loaded {loaded_params} parameters total")
-        print(f"    - Left branch: {left_branch_params} parameters")
-        print(f"    - Right branch: {right_branch_params} parameters")
+        print(f"    - Left branch:          {left_branch_params} parameters")
+        print(f"    - Right branch:         {right_branch_params} parameters")
+        print(f"    - Single stream blocks: {single_stream_params} parameters")
         print("✓ Adaptation weights loaded successfully")
     
     def set_llm_hidden_size(self, llm_hidden_size):
